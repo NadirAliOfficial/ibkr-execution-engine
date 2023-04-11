@@ -169,4 +169,4 @@ Open `http://127.0.0.1:5000`
 - **ib_insync** — IBKR API wrapper
 - **Flask** — local web UI and API
 - **JSON** — state persistence
-<!-- updated: 2026-04-07-02 -->
+<!-- updated: 2023-04-11-r01 -->
