@@ -1,0 +1,77 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class ExecutionEngine:
+
+    def __init__(self, broker, risk_manager, order_manager):
+        self.broker = broker
+        self.risk = risk_manager
+        self.orders = order_manager
+
+        self.broker.set_fill_callback(self._on_fill)
+        self.broker.set_status_callback(self._on_status)
+        self.broker.set_disconnect_callback(self._on_disconnect)
+
+    def execute(self, symbol, side, entry_price, stop_price, risk_amount):
+        if not self.broker.is_connected:
+            raise ConnectionError("Not connected to IBKR Gateway")
+
+        side = side.upper()
+        if side not in ("BUY", "SELL"):
+            raise ValueError("Side must be BUY or SELL")
+
+        if side == "BUY" and stop_price >= entry_price:
+            raise ValueError("Stop price must be below entry price for BUY")
+        if side == "SELL" and stop_price <= entry_price:
+            raise ValueError("Stop price must be above entry price for SELL")
+
+        if risk_amount <= 0:
+            raise ValueError("Risk amount must be positive")
+
+        trade = self.orders.create_trade(symbol, side, entry_price, stop_price, risk_amount)
+        trade = self.orders.execute_trade(trade["trade_id"])
+
+        logger.info(f"Execution started: {trade['trade_id']}")
+        return trade
+
+    def _on_fill(self, ib_trade, fill):
+        order_id = ib_trade.order.orderId
+        filled_qty = fill.execution.shares
+        avg_price = fill.execution.price
+
+        # Get cumulative filled from order status
+        cumulative = ib_trade.orderStatus.filled
+        self.orders.handle_fill(order_id, cumulative, avg_price)
+
+    def _on_status(self, ib_trade):
+        order_id = ib_trade.order.orderId
+        status = ib_trade.orderStatus.status
+        self.orders.handle_order_status(order_id, status)
+
+    def _on_disconnect(self):
+        logger.warning("Connection lost — attempting reconnect")
+        if self.broker.reconnect():
+            logger.info("Reconnected — recovering trade state")
+            self.orders.recover_state()
+        else:
+            logger.error("Reconnect failed — manual intervention required")
+
+    def cancel_trade(self, trade_id):
+        trade = self.orders.trades.get(trade_id)
+        if not trade:
+            raise ValueError(f"Trade {trade_id} not found")
+        self.orders._cancel_remaining_orders(trade)
+        trade["state"] = "cancelled"
+        trade["updated_at"] = __import__("datetime").datetime.now().isoformat()
+        self.orders._save_state()
+        logger.info(f"Trade {trade_id} cancelled")
+
+    def get_status(self, trade_id=None):
+        if trade_id:
+            return self.orders.get_trade_status(trade_id)
+        return self.orders.get_all_trades()
+
+    def get_active_trades(self):
+        return self.orders.get_active_trades()

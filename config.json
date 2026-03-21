@@ -1,0 +1,25 @@
+{
+    "ibkr": {
+        "host": "127.0.0.1",
+        "port": 4002,
+        "client_id": 1,
+        "account": "",
+        "timeout": 30,
+        "readonly": false
+    },
+    "defaults": {
+        "risk_per_trade": 100.0,
+        "tp1_pct": 0.50,
+        "tp2_pct": 0.40,
+        "runner_pct": 0.10,
+        "trailing_stop_pct": 0.02
+    },
+    "state": {
+        "persistence_file": "state/trades.json"
+    },
+    "ui": {
+        "host": "127.0.0.1",
+        "port": 5000,
+        "debug": false
+    }
+}

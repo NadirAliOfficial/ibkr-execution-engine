@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IBKR Execution Engine</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+            background: #0d1117;
+            color: #c9d1d9;
+            min-height: 100vh;
+        }
+        .header {
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { font-size: 18px; color: #58a6ff; }
+        .status-dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            display: inline-block; margin-right: 6px;
+        }
+        .status-dot.connected { background: #3fb950; }
+        .status-dot.disconnected { background: #f85149; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+        .grid { display: grid; grid-template-columns: 380px 1fr; gap: 24px; }
+
+        /* Control Panel */
+        .panel {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 20px;
+        }
+        .panel h2 {
+            font-size: 14px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 16px;
+        }
+        .form-group { margin-bottom: 14px; }
+        .form-group label {
+            display: block;
+            font-size: 12px;
+            color: #8b949e;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 10px 12px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #c9d1d9;
+            font-size: 14px;
+            font-family: monospace;
+        }
+        .form-group input:focus, .form-group select:focus {
+            outline: none;
+            border-color: #58a6ff;
+        }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .btn-execute {
+            width: 100%;
+            padding: 12px;
+            background: #238636;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 8px;
+            transition: background 0.2s;
+        }
+        .btn-execute:hover { background: #2ea043; }
+        .btn-execute:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+
+        /* Preview */
+        .preview {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 12px;
+            margin-top: 14px;
+            font-size: 13px;
+        }
+        .preview-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 0;
+        }
+        .preview-label { color: #8b949e; }
+        .preview-value { color: #c9d1d9; font-weight: 500; }
+
+        /* Trades Table */
+        .trades-panel { min-height: 400px; }
+        table { width: 100%; border-collapse: collapse; }
+        th {
+            text-align: left;
+            font-size: 11px;
+            color: #8b949e;
+            text-transform: uppercase;
+            padding: 8px 12px;
+            border-bottom: 1px solid #30363d;
+        }
+        td {
+            padding: 10px 12px;
+            font-size: 13px;
+            border-bottom: 1px solid #21262d;
+        }
+        .state-badge {
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .state-pending { background: #30363d; color: #8b949e; }
+        .state-entry_placed { background: #1f3a5f; color: #58a6ff; }
+        .state-entry_filled { background: #1a4b2e; color: #3fb950; }
+        .state-tp1_filled { background: #2d1f00; color: #d29922; }
+        .state-tp2_filled { background: #2d1f00; color: #e3b341; }
+        .state-runner_active { background: #3d1f5e; color: #bc8cff; }
+        .state-closed { background: #21262d; color: #8b949e; }
+        .state-cancelled { background: #3d1117; color: #f85149; }
+
+        .btn-cancel {
+            padding: 4px 10px;
+            background: transparent;
+            border: 1px solid #f85149;
+            color: #f85149;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .btn-cancel:hover { background: #3d1117; }
+
+        .no-trades {
+            text-align: center;
+            color: #484f58;
+            padding: 40px;
+            font-size: 14px;
+        }
+        .error-msg {
+            background: #3d1117;
+            border: 1px solid #f85149;
+            color: #f85149;
+            padding: 10px 14px;
+            border-radius: 6px;
+            margin-top: 12px;
+            font-size: 13px;
+            display: none;
+        }
+        .success-msg {
+            background: #1a4b2e;
+            border: 1px solid #3fb950;
+            color: #3fb950;
+            padding: 10px 14px;
+            border-radius: 6px;
+            margin-top: 12px;
+            font-size: 13px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>IBKR Execution Engine</h1>
+        <div id="connectionStatus">
+            <span class="status-dot disconnected" id="statusDot"></span>
+            <span id="statusText">Checking...</span>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="grid">
+            <!-- Control Panel -->
+            <div>
+                <div class="panel">
+                    <h2>New Trade</h2>
+                    <div class="form-group">
+                        <label>Ticker</label>
+                        <input type="text" id="symbol" placeholder="AAPL" autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label>Side</label>
+                        <select id="side">
+                            <option value="BUY">BUY (Long)</option>
+                            <option value="SELL">SELL (Short)</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Entry Price</label>
+                            <input type="number" id="entryPrice" step="0.01" placeholder="0.00">
+                        </div>
+                        <div class="form-group">
+                            <label>Stop Price</label>
+                            <input type="number" id="stopPrice" step="0.01" placeholder="0.00">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Risk Per Trade ($)</label>
+                        <input type="number" id="riskAmount" step="1" value="{{ defaults.risk_per_trade }}">
+                    </div>
+
+                    <!-- Order Preview -->
+                    <div class="preview" id="preview" style="display:none;">
+                        <div class="preview-row">
+                            <span class="preview-label">Position Size</span>
+                            <span class="preview-value" id="prevShares">-</span>
+                        </div>
+                        <div class="preview-row">
+                            <span class="preview-label">Risk/Share</span>
+                            <span class="preview-value" id="prevRiskPerShare">-</span>
+                        </div>
+                        <div class="preview-row">
+                            <span class="preview-label">TP1 (50%)</span>
+                            <span class="preview-value" id="prevTP1">-</span>
+                        </div>
+                        <div class="preview-row">
+                            <span class="preview-label">TP2 (40%)</span>
+                            <span class="preview-value" id="prevTP2">-</span>
+                        </div>
+                        <div class="preview-row">
+                            <span class="preview-label">Runner (10%)</span>
+                            <span class="preview-value" id="prevRunner">-</span>
+                        </div>
+                    </div>
+
+                    <button class="btn-execute" id="executeBtn" onclick="executeTrade()">
+                        Execute Trade
+                    </button>
+
+                    <div class="error-msg" id="errorMsg"></div>
+                    <div class="success-msg" id="successMsg"></div>
+                </div>
+            </div>
+
+            <!-- Trades Panel -->
+            <div class="panel trades-panel">
+                <h2>Active Trades</h2>
+                <div id="tradesContainer">
+                    <div class="no-trades">No active trades</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Live preview
+        const fields = ['entryPrice', 'stopPrice', 'riskAmount', 'side'];
+        fields.forEach(id => {
+            document.getElementById(id).addEventListener('input', updatePreview);
+            document.getElementById(id).addEventListener('change', updatePreview);
+        });
+
+        function updatePreview() {
+            const entry = parseFloat(document.getElementById('entryPrice').value);
+            const stop = parseFloat(document.getElementById('stopPrice').value);
+            const risk = parseFloat(document.getElementById('riskAmount').value);
+            const side = document.getElementById('side').value;
+            const preview = document.getElementById('preview');
+
+            if (!entry || !stop || !risk || entry === stop) {
+                preview.style.display = 'none';
+                return;
+            }
+
+            const riskPerShare = Math.abs(entry - stop);
+            const totalShares = Math.floor(risk / riskPerShare);
+            if (totalShares <= 0) { preview.style.display = 'none'; return; }
+
+            const tp1Qty = Math.floor(totalShares * 0.50);
+            const tp2Qty = Math.floor(totalShares * 0.40);
+            const runnerQty = totalShares - tp1Qty - tp2Qty;
+
+            const riskAmt = Math.abs(entry - stop);
+            let tp1Price, tp2Price;
+            if (side === 'BUY') {
+                tp1Price = (entry + riskAmt * 1.5).toFixed(2);
+                tp2Price = (entry + riskAmt * 2.5).toFixed(2);
+            } else {
+                tp1Price = (entry - riskAmt * 1.5).toFixed(2);
+                tp2Price = (entry - riskAmt * 2.5).toFixed(2);
+            }
+
+            document.getElementById('prevShares').textContent = totalShares + ' shares';
+            document.getElementById('prevRiskPerShare').textContent = '$' + riskPerShare.toFixed(2);
+            document.getElementById('prevTP1').textContent = tp1Qty + ' @ $' + tp1Price;
+            document.getElementById('prevTP2').textContent = tp2Qty + ' @ $' + tp2Price;
+            document.getElementById('prevRunner').textContent = runnerQty + ' (trailing)';
+            preview.style.display = 'block';
+        }
+
+        // Execute trade
+        async function executeTrade() {
+            const btn = document.getElementById('executeBtn');
+            const errorMsg = document.getElementById('errorMsg');
+            const successMsg = document.getElementById('successMsg');
+            errorMsg.style.display = 'none';
+            successMsg.style.display = 'none';
+
+            const data = {
+                symbol: document.getElementById('symbol').value,
+                side: document.getElementById('side').value,
+                entry_price: document.getElementById('entryPrice').value,
+                stop_price: document.getElementById('stopPrice').value,
+                risk_amount: document.getElementById('riskAmount').value,
+            };
+
+            if (!data.symbol || !data.entry_price || !data.stop_price || !data.risk_amount) {
+                errorMsg.textContent = 'All fields are required';
+                errorMsg.style.display = 'block';
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Placing Orders...';
+
+            try {
+                const res = await fetch('/api/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data),
+                });
+                const result = await res.json();
+
+                if (result.success) {
+                    successMsg.textContent = `Trade placed: ${result.trade_id} | ${result.total_shares} shares`;
+                    successMsg.style.display = 'block';
+                    refreshTrades();
+                } else {
+                    errorMsg.textContent = result.error;
+                    errorMsg.style.display = 'block';
+                }
+            } catch (e) {
+                errorMsg.textContent = 'Connection error: ' + e.message;
+                errorMsg.style.display = 'block';
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Execute Trade';
+        }
+
+        // Refresh trades
+        async function refreshTrades() {
+            try {
+                const res = await fetch('/api/trades');
+                const trades = await res.json();
+                const container = document.getElementById('tradesContainer');
+
+                const tradeIds = Object.keys(trades);
+                if (tradeIds.length === 0) {
+                    container.innerHTML = '<div class="no-trades">No trades</div>';
+                    return;
+                }
+
+                // Sort by most recent first
+                tradeIds.sort((a, b) => (trades[b].updated_at || '').localeCompare(trades[a].updated_at || ''));
+
+                let html = `<table>
+                    <thead><tr>
+                        <th>Symbol</th><th>Side</th><th>Entry</th><th>Shares</th>
+                        <th>State</th><th>TP1</th><th>TP2</th><th>BE</th><th></th>
+                    </tr></thead><tbody>`;
+
+                for (const id of tradeIds) {
+                    const t = trades[id];
+                    const stateClass = 'state-' + (t.state || 'pending');
+                    const cancelBtn = ['closed', 'cancelled'].includes(t.state) ? '' :
+                        `<button class="btn-cancel" onclick="cancelTrade('${id}')">Cancel</button>`;
+
+                    html += `<tr>
+                        <td><strong>${t.symbol}</strong></td>
+                        <td>${t.side}</td>
+                        <td>$${t.entry_price}</td>
+                        <td>${t.total_shares}</td>
+                        <td><span class="state-badge ${stateClass}">${t.state}</span></td>
+                        <td>${t.filled?.tp1 || 0}/${t.bracket_sizes?.tp1 || '-'}</td>
+                        <td>${t.filled?.tp2 || 0}/${t.bracket_sizes?.tp2 || '-'}</td>
+                        <td>${t.breakeven_moved ? 'Yes' : '-'}</td>
+                        <td>${cancelBtn}</td>
+                    </tr>`;
+                }
+
+                html += '</tbody></table>';
+                container.innerHTML = html;
+            } catch (e) {
+                console.error('Failed to refresh trades:', e);
+            }
+        }
+
+        // Cancel trade
+        async function cancelTrade(tradeId) {
+            if (!confirm('Cancel this trade?')) return;
+            try {
+                await fetch(`/api/trade/${tradeId}/cancel`, { method: 'POST' });
+                refreshTrades();
+            } catch (e) {
+                alert('Cancel failed: ' + e.message);
+            }
+        }
+
+        // Connection status check
+        async function checkConnection() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                const dot = document.getElementById('statusDot');
+                const text = document.getElementById('statusText');
+                if (data.connected) {
+                    dot.className = 'status-dot connected';
+                    text.textContent = 'Connected';
+                } else {
+                    dot.className = 'status-dot disconnected';
+                    text.textContent = 'Disconnected';
+                }
+            } catch (e) {
+                document.getElementById('statusDot').className = 'status-dot disconnected';
+                document.getElementById('statusText').textContent = 'Error';
+            }
+        }
+
+        // Poll
+        setInterval(checkConnection, 5000);
+        setInterval(refreshTrades, 3000);
+        checkConnection();
+        refreshTrades();
+    </script>
+</body>
+</html>

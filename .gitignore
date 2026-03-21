@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+state/trades.json
+execution_engine.log
+.env
