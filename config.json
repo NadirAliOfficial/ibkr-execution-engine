@@ -1,7 +1,7 @@
 {
     "ibkr": {
         "host": "127.0.0.1",
-        "port": 4002,
+        "port": 7497,
         "client_id": 1,
         "account": "",
         "timeout": 30,
@@ -19,7 +19,7 @@
     },
     "ui": {
         "host": "127.0.0.1",
-        "port": 5000,
+        "port": 5050,
         "debug": false
     }
 }

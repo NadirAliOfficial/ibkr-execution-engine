@@ -45,11 +45,27 @@ def main():
     if broker.is_connected:
         order_manager.recover_state()
 
-    # Start Flask UI
+    # Start Flask UI in background thread
     app = create_app(execution_engine, signal_adapter, broker, config)
     ui_config = config["ui"]
-    logger.info(f"Starting UI at http://{ui_config['host']}:{ui_config['port']}")
-    app.run(host=ui_config["host"], port=ui_config["port"], debug=ui_config["debug"])
+    flask_thread = threading.Thread(
+        target=lambda: app.run(
+            host=ui_config["host"],
+            port=ui_config["port"],
+            debug=False,
+            use_reloader=False,
+        ),
+        daemon=True,
+    )
+    flask_thread.start()
+    logger.info(f"UI started at http://{ui_config['host']}:{ui_config['port']}")
+
+    # Run IB event loop in main thread — processes commands from Flask via queue
+    try:
+        broker.run_loop()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        broker.disconnect()
 
 
 if __name__ == "__main__":

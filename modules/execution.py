@@ -59,12 +59,17 @@ class ExecutionEngine:
             logger.error("Reconnect failed — manual intervention required")
 
     def cancel_trade(self, trade_id):
+        from datetime import datetime
+        from modules.order_manager import TradeState
         trade = self.orders.trades.get(trade_id)
         if not trade:
             raise ValueError(f"Trade {trade_id} not found")
-        self.orders._cancel_remaining_orders(trade)
-        trade["state"] = "cancelled"
-        trade["updated_at"] = __import__("datetime").datetime.now().isoformat()
+        try:
+            self.orders._cancel_remaining_orders(trade)
+        except Exception as e:
+            logger.warning(f"Error cancelling IB orders for {trade_id}: {e}")
+        trade["state"] = TradeState.CANCELLED
+        trade["updated_at"] = datetime.now().isoformat()
         self.orders._save_state()
         logger.info(f"Trade {trade_id} cancelled")
 
