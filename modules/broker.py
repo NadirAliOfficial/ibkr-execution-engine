@@ -65,9 +65,9 @@ class IBKRBroker:
                 readonly=self.config["readonly"],
             )
             self._connected = True
-            self.ib.disconnectedEvent += self._handle_disconnect
-            self.ib.execDetailsEvent += self._handle_exec_details
-            self.ib.orderStatusEvent += self._handle_order_status
+            self.ib.disconnectedEvent += lambda: self._handle_disconnect()
+            self.ib.execDetailsEvent += lambda trade, fill: self._handle_exec_details(trade, fill)
+            self.ib.orderStatusEvent += lambda trade: self._handle_order_status(trade)
             logger.info("Connected to IBKR Gateway")
             return True
         except Exception as e:

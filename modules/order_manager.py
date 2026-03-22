@@ -250,8 +250,16 @@ class OrderManager:
             logger.info("No trade state to recover")
             return
 
-        open_trades = {t.order.orderId: t for t in self.broker.get_open_trades()}
-        positions = {p.contract.symbol: p for p in self.broker.get_positions()}
+        try:
+            ib_trades = self.broker.ib.openTrades()
+            ib_positions = self.broker.ib.positions()
+        except Exception as e:
+            logger.warning(f"Could not fetch IB state for recovery: {e}")
+            ib_trades = []
+            ib_positions = []
+
+        open_trades = {t.order.orderId: t for t in ib_trades}
+        positions = {p.contract.symbol: p for p in ib_positions}
 
         for trade_id, trade in self.trades.items():
             if trade["state"] in (TradeState.CLOSED, TradeState.CANCELLED):
