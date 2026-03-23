@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime
+from ib_insync import Stock, Order
 
 logger = logging.getLogger(__name__)
 
@@ -173,18 +174,17 @@ class OrderManager:
         if trade["breakeven_moved"]:
             return
 
-        contract = self.broker.create_contract(trade["symbol"])
         stop_order_id = trade["order_ids"].get("stop")
-
         if not stop_order_id:
             return
 
-        # Find the stop trade object
-        for t in self.broker.get_open_trades():
+        # Direct IB calls — this runs inside an IB callback (main thread)
+        for t in self.broker.ib.openTrades():
             if t.order.orderId == stop_order_id:
-                # Reduce stop quantity (TP1 already filled)
                 new_qty = trade["bracket_sizes"]["tp2"] + trade["bracket_sizes"]["runner"]
-                self.broker.modify_order(t, auxPrice=trade["entry_price"], totalQuantity=new_qty)
+                t.order.auxPrice = trade["entry_price"]
+                t.order.totalQuantity = new_qty
+                self.broker.ib.placeOrder(t.contract, t.order)
                 trade["breakeven_moved"] = True
                 trade["updated_at"] = datetime.now().isoformat()
                 logger.info(f"Trade {trade['trade_id']}: Stop moved to breakeven @{trade['entry_price']} qty={new_qty}")
@@ -197,21 +197,26 @@ class OrderManager:
         if trade["runner_trailing_active"]:
             return
 
-        contract = self.broker.create_contract(trade["symbol"])
         stop_order_id = trade["order_ids"].get("stop")
 
+        # Direct IB calls — this runs inside an IB callback (main thread)
         # Cancel existing stop
         if stop_order_id:
-            for t in self.broker.get_open_trades():
+            for t in self.broker.ib.openTrades():
                 if t.order.orderId == stop_order_id:
-                    self.broker.cancel_order(t)
+                    self.broker.ib.cancelOrder(t.order)
                     break
 
         # Place trailing stop for runner
-        trailing_trade = self.broker.place_trailing_stop(
-            contract, trade["exit_side"], trade["bracket_sizes"]["runner"],
-            trade["trailing_stop_pct"]
-        )
+        contract = Stock(trade["symbol"], "SMART", "USD")
+        self.broker.ib.qualifyContracts(contract)
+        order = Order()
+        order.action = trade["exit_side"]
+        order.totalQuantity = trade["bracket_sizes"]["runner"]
+        order.orderType = "TRAIL"
+        order.trailingPercent = trade["trailing_stop_pct"] * 100
+        order.tif = "GTC"
+        trailing_trade = self.broker.ib.placeOrder(contract, order)
         trade["order_ids"]["trailing_stop"] = trailing_trade.order.orderId
         trade["runner_trailing_active"] = True
         trade["state"] = TradeState.RUNNER_ACTIVE
@@ -221,14 +226,14 @@ class OrderManager:
         self._save_state()
 
     def _cancel_remaining_orders(self, trade):
-        contract = self.broker.create_contract(trade["symbol"])
-        open_trades = self.broker.get_open_trades()
+        # Direct IB calls — this runs inside an IB callback (main thread)
+        open_trades = self.broker.ib.openTrades()
 
         all_order_ids = set(trade["order_ids"].values())
         for t in open_trades:
             if t.order.orderId in all_order_ids:
                 try:
-                    self.broker.cancel_order(t)
+                    self.broker.ib.cancelOrder(t.order)
                 except Exception as e:
                     logger.warning(f"Could not cancel order {t.order.orderId}: {e}")
 
@@ -281,6 +286,14 @@ class OrderManager:
             if symbol in positions:
                 pos = positions[symbol]
                 logger.info(f"  Position: {pos.position} shares @ avg {pos.avgCost}")
+
+                # If entry order is no longer active but we have a position, entry was filled
+                entry_oid = trade["order_ids"].get("entry")
+                if trade["state"] == TradeState.ENTRY_PLACED and entry_oid not in open_trades:
+                    trade["filled_qty"]["entry"] = trade["total_shares"]
+                    trade["state"] = TradeState.ENTRY_FILLED
+                    trade["updated_at"] = datetime.now().isoformat()
+                    logger.info(f"  Recovery: entry filled, state -> entry_filled")
             else:
                 if trade["state"] not in (TradeState.PENDING, TradeState.ENTRY_PLACED):
                     logger.warning(f"  No position found but trade state is {trade['state']}")

@@ -38,11 +38,8 @@ class ExecutionEngine:
 
     def _on_fill(self, ib_trade, fill):
         order_id = ib_trade.order.orderId
-        filled_qty = fill.execution.shares
-        avg_price = fill.execution.price
-
-        # Get cumulative filled from order status
-        cumulative = ib_trade.orderStatus.filled
+        avg_price = fill.execution.avgPrice
+        cumulative = fill.execution.cumQty
         self.orders.handle_fill(order_id, cumulative, avg_price)
 
     def _on_status(self, ib_trade):
@@ -64,8 +61,17 @@ class ExecutionEngine:
         trade = self.orders.trades.get(trade_id)
         if not trade:
             raise ValueError(f"Trade {trade_id} not found")
+        # Cancel IB orders via queued broker calls (safe from Flask thread)
+        all_order_ids = set(trade["order_ids"].values())
         try:
-            self.orders._cancel_remaining_orders(trade)
+            open_trades = self.broker.get_open_trades()
+            if open_trades:
+                for t in open_trades:
+                    if t.order.orderId in all_order_ids:
+                        try:
+                            self.broker.cancel_order(t)
+                        except Exception as e:
+                            logger.warning(f"Could not cancel order {t.order.orderId}: {e}")
         except Exception as e:
             logger.warning(f"Error cancelling IB orders for {trade_id}: {e}")
         trade["state"] = TradeState.CANCELLED
