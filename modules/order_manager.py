@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from ib_insync import Stock, Order
+from ib_insync import Stock, Order, LimitOrder, StopOrder
 
 logger = logging.getLogger(__name__)
 
@@ -71,42 +71,17 @@ class OrderManager:
         trade = self.trades[trade_id]
         contract = self.broker.create_contract(trade["symbol"])
 
-        # Place entry order
+        # Place entry order only — child orders placed after entry fills
         entry_trade = self.broker.place_limit_order(
             contract, trade["side"], trade["total_shares"], trade["entry_price"]
         )
-        parent_id = entry_trade.order.orderId
-        trade["order_ids"]["entry"] = parent_id
-
-        # Place TP1 limit order
-        tp1_trade = self.broker.place_limit_order(
-            contract, trade["exit_side"], trade["bracket_sizes"]["tp1"],
-            trade["tp_prices"]["tp1"], parent_id=parent_id
-        )
-        trade["order_ids"]["tp1"] = tp1_trade.order.orderId
-
-        # Place TP2 limit order
-        tp2_trade = self.broker.place_limit_order(
-            contract, trade["exit_side"], trade["bracket_sizes"]["tp2"],
-            trade["tp_prices"]["tp2"], parent_id=parent_id
-        )
-        trade["order_ids"]["tp2"] = tp2_trade.order.orderId
-
-        # Place initial stop loss (covers full remaining position)
-        stop_qty = trade["total_shares"]
-        stop_trade = self.broker.place_stop_order(
-            contract, trade["exit_side"], stop_qty,
-            trade["stop_price"], parent_id=parent_id
-        )
-        trade["order_ids"]["stop"] = stop_trade.order.orderId
+        trade["order_ids"]["entry"] = entry_trade.order.orderId
 
         trade["state"] = TradeState.ENTRY_PLACED
         trade["updated_at"] = datetime.now().isoformat()
         self._save_state()
 
-        logger.info(f"Trade {trade_id} orders placed: entry={parent_id} "
-                     f"tp1={trade['order_ids']['tp1']} tp2={trade['order_ids']['tp2']} "
-                     f"stop={trade['order_ids']['stop']}")
+        logger.info(f"Trade {trade_id} entry placed: id={trade['order_ids']['entry']}")
 
         return trade
 
@@ -123,6 +98,7 @@ class OrderManager:
             if filled_qty >= trade["total_shares"]:
                 trade["state"] = TradeState.ENTRY_FILLED
                 logger.info(f"Trade {trade_id}: Entry fully filled {filled_qty}@{avg_price}")
+                self._place_exit_orders(trade)
             else:
                 logger.info(f"Trade {trade_id}: Entry partial fill {filled_qty}/{trade['total_shares']}@{avg_price}")
 
@@ -169,6 +145,37 @@ class OrderManager:
             trade["updated_at"] = datetime.now().isoformat()
             self._cancel_remaining_orders(trade)
             self._save_state()
+
+    def _place_exit_orders(self, trade):
+        """Place TP1, TP2, and stop orders after entry fills. Direct IB calls (callback context)."""
+        contract = Stock(trade["symbol"], "SMART", "USD")
+        self.broker.ib.qualifyContracts(contract)
+
+        # TP1
+        tp1_order = LimitOrder(trade["exit_side"], trade["bracket_sizes"]["tp1"],
+                               trade["tp_prices"]["tp1"], tif="GTC")
+        tp1_trade = self.broker.ib.placeOrder(contract, tp1_order)
+        trade["order_ids"]["tp1"] = tp1_trade.order.orderId
+        logger.info(f"Trade {trade['trade_id']}: TP1 placed id={tp1_trade.order.orderId} "
+                     f"{trade['bracket_sizes']['tp1']}@{trade['tp_prices']['tp1']}")
+
+        # TP2
+        tp2_order = LimitOrder(trade["exit_side"], trade["bracket_sizes"]["tp2"],
+                               trade["tp_prices"]["tp2"], tif="GTC")
+        tp2_trade = self.broker.ib.placeOrder(contract, tp2_order)
+        trade["order_ids"]["tp2"] = tp2_trade.order.orderId
+        logger.info(f"Trade {trade['trade_id']}: TP2 placed id={tp2_trade.order.orderId} "
+                     f"{trade['bracket_sizes']['tp2']}@{trade['tp_prices']['tp2']}")
+
+        # Stop loss (full position)
+        stop_order = StopOrder(trade["exit_side"], trade["total_shares"],
+                               trade["stop_price"], tif="GTC")
+        stop_trade = self.broker.ib.placeOrder(contract, stop_order)
+        trade["order_ids"]["stop"] = stop_trade.order.orderId
+        logger.info(f"Trade {trade['trade_id']}: Stop placed id={stop_trade.order.orderId} "
+                     f"{trade['total_shares']}@{trade['stop_price']}")
+
+        self._save_state()
 
     def _move_stop_to_breakeven(self, trade):
         if trade["breakeven_moved"]:
@@ -294,6 +301,10 @@ class OrderManager:
                     trade["state"] = TradeState.ENTRY_FILLED
                     trade["updated_at"] = datetime.now().isoformat()
                     logger.info(f"  Recovery: entry filled, state -> entry_filled")
+                    # Place exit orders if they don't exist yet
+                    if "tp1" not in trade["order_ids"]:
+                        logger.info(f"  Recovery: placing exit orders for {trade_id}")
+                        self._place_exit_orders(trade)
             else:
                 if trade["state"] not in (TradeState.PENDING, TradeState.ENTRY_PLACED):
                     logger.warning(f"  No position found but trade state is {trade['state']}")
