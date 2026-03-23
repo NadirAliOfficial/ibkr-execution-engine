@@ -148,8 +148,14 @@ class OrderManager:
 
     def _place_exit_orders(self, trade):
         """Place TP1, TP2, and stop orders after entry fills. Direct IB calls (callback context)."""
-        contract = Stock(trade["symbol"], "SMART", "USD")
-        self.broker.ib.qualifyContracts(contract)
+        # Get qualified contract from the filled entry trade
+        contract = None
+        for t in self.broker.ib.trades():
+            if t.order.orderId == trade["order_ids"]["entry"]:
+                contract = t.contract
+                break
+        if not contract:
+            contract = Stock(trade["symbol"], "SMART", "USD")
 
         # TP1
         tp1_order = LimitOrder(trade["exit_side"], trade["bracket_sizes"]["tp1"],
@@ -214,9 +220,14 @@ class OrderManager:
                     self.broker.ib.cancelOrder(t.order)
                     break
 
-        # Place trailing stop for runner
-        contract = Stock(trade["symbol"], "SMART", "USD")
-        self.broker.ib.qualifyContracts(contract)
+        # Place trailing stop for runner — get contract from existing trade
+        contract = None
+        for t in self.broker.ib.trades():
+            if t.order.orderId == trade["order_ids"]["entry"]:
+                contract = t.contract
+                break
+        if not contract:
+            contract = Stock(trade["symbol"], "SMART", "USD")
         order = Order()
         order.action = trade["exit_side"]
         order.totalQuantity = trade["bracket_sizes"]["runner"]
