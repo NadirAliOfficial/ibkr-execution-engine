@@ -281,7 +281,10 @@ class OrderManager:
                     logger.warning(f"Could not cancel order {t.order.orderId}: {e}")
 
     def _find_trade_by_order(self, order_id):
+        # Skip closed/cancelled trades — IB reuses order IDs across sessions
         for trade in self.trades.values():
+            if trade["state"] in (TradeState.CLOSED, TradeState.CANCELLED):
+                continue
             if order_id in trade["order_ids"].values():
                 return trade
         return None
