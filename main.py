@@ -44,6 +44,7 @@ def main():
     # Recover any existing trade state
     if broker.is_connected:
         order_manager.recover_state()
+        broker.set_verify_callback(order_manager.verify_stops)
 
     # Start Flask UI in background thread
     app = create_app(execution_engine, signal_adapter, broker, config)

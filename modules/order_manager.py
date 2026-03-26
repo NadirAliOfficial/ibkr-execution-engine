@@ -148,6 +148,11 @@ class OrderManager:
 
     def _place_exit_orders(self, trade):
         """Place TP1, TP2, and stop orders after entry fills. Direct IB calls (callback context)."""
+        # Guard: don't place exit orders twice
+        if "stop" in trade["order_ids"]:
+            logger.warning(f"Trade {trade['trade_id']}: Exit orders already placed, skipping")
+            return
+
         # Get qualified contract from the filled entry trade
         contract = None
         for t in self.broker.ib.trades():
@@ -155,31 +160,49 @@ class OrderManager:
                 contract = t.contract
                 break
         if not contract:
+            logger.error(f"Trade {trade['trade_id']}: Could not find qualified contract from entry trade")
             contract = Stock(trade["symbol"], "SMART", "USD")
+            try:
+                self.broker.ib.qualifyContracts(contract)
+            except Exception as e:
+                logger.error(f"Trade {trade['trade_id']}: Failed to qualify fallback contract: {e}")
+                return
+
+        # Place STOP FIRST — position protection is the priority
+        try:
+            stop_order = StopOrder(trade["exit_side"], trade["total_shares"],
+                                   trade["stop_price"], tif="GTC", outsideRth=True)
+            stop_trade = self.broker.ib.placeOrder(contract, stop_order)
+            trade["order_ids"]["stop"] = stop_trade.order.orderId
+            logger.info(f"Trade {trade['trade_id']}: Stop placed id={stop_trade.order.orderId} "
+                         f"{trade['total_shares']}@{trade['stop_price']}")
+            self._save_state()
+        except Exception as e:
+            logger.error(f"Trade {trade['trade_id']}: CRITICAL — stop order placement failed: {e}")
+            self._save_state()
+            return
 
         # TP1
-        tp1_order = LimitOrder(trade["exit_side"], trade["bracket_sizes"]["tp1"],
-                               trade["tp_prices"]["tp1"], tif="GTC")
-        tp1_trade = self.broker.ib.placeOrder(contract, tp1_order)
-        trade["order_ids"]["tp1"] = tp1_trade.order.orderId
-        logger.info(f"Trade {trade['trade_id']}: TP1 placed id={tp1_trade.order.orderId} "
-                     f"{trade['bracket_sizes']['tp1']}@{trade['tp_prices']['tp1']}")
+        try:
+            tp1_order = LimitOrder(trade["exit_side"], trade["bracket_sizes"]["tp1"],
+                                   trade["tp_prices"]["tp1"], tif="GTC", outsideRth=True)
+            tp1_trade = self.broker.ib.placeOrder(contract, tp1_order)
+            trade["order_ids"]["tp1"] = tp1_trade.order.orderId
+            logger.info(f"Trade {trade['trade_id']}: TP1 placed id={tp1_trade.order.orderId} "
+                         f"{trade['bracket_sizes']['tp1']}@{trade['tp_prices']['tp1']}")
+        except Exception as e:
+            logger.error(f"Trade {trade['trade_id']}: TP1 placement failed: {e}")
 
         # TP2
-        tp2_order = LimitOrder(trade["exit_side"], trade["bracket_sizes"]["tp2"],
-                               trade["tp_prices"]["tp2"], tif="GTC")
-        tp2_trade = self.broker.ib.placeOrder(contract, tp2_order)
-        trade["order_ids"]["tp2"] = tp2_trade.order.orderId
-        logger.info(f"Trade {trade['trade_id']}: TP2 placed id={tp2_trade.order.orderId} "
-                     f"{trade['bracket_sizes']['tp2']}@{trade['tp_prices']['tp2']}")
-
-        # Stop loss (full position)
-        stop_order = StopOrder(trade["exit_side"], trade["total_shares"],
-                               trade["stop_price"], tif="GTC")
-        stop_trade = self.broker.ib.placeOrder(contract, stop_order)
-        trade["order_ids"]["stop"] = stop_trade.order.orderId
-        logger.info(f"Trade {trade['trade_id']}: Stop placed id={stop_trade.order.orderId} "
-                     f"{trade['total_shares']}@{trade['stop_price']}")
+        try:
+            tp2_order = LimitOrder(trade["exit_side"], trade["bracket_sizes"]["tp2"],
+                                   trade["tp_prices"]["tp2"], tif="GTC", outsideRth=True)
+            tp2_trade = self.broker.ib.placeOrder(contract, tp2_order)
+            trade["order_ids"]["tp2"] = tp2_trade.order.orderId
+            logger.info(f"Trade {trade['trade_id']}: TP2 placed id={tp2_trade.order.orderId} "
+                         f"{trade['bracket_sizes']['tp2']}@{trade['tp_prices']['tp2']}")
+        except Exception as e:
+            logger.error(f"Trade {trade['trade_id']}: TP2 placement failed: {e}")
 
         self._save_state()
 
@@ -197,6 +220,7 @@ class OrderManager:
                 new_qty = trade["bracket_sizes"]["tp2"] + trade["bracket_sizes"]["runner"]
                 t.order.auxPrice = trade["entry_price"]
                 t.order.totalQuantity = new_qty
+                t.order.outsideRth = True
                 self.broker.ib.placeOrder(t.contract, t.order)
                 trade["breakeven_moved"] = True
                 trade["updated_at"] = datetime.now().isoformat()
@@ -234,6 +258,7 @@ class OrderManager:
         order.orderType = "TRAIL"
         order.trailingPercent = trade["trailing_stop_pct"] * 100
         order.tif = "GTC"
+        order.outsideRth = True
         trailing_trade = self.broker.ib.placeOrder(contract, order)
         trade["order_ids"]["trailing_stop"] = trailing_trade.order.orderId
         trade["runner_trailing_active"] = True
@@ -324,6 +349,41 @@ class OrderManager:
 
         self._save_state()
         logger.info("State recovery complete")
+
+    def verify_stops(self):
+        """Check all filled trades have active stop orders. Re-place if missing.
+        Called periodically from the IB event loop (main thread)."""
+        open_order_ids = set()
+        try:
+            for t in self.broker.ib.openTrades():
+                open_order_ids.add(t.order.orderId)
+        except Exception as e:
+            logger.warning(f"verify_stops: Could not fetch open trades: {e}")
+            return
+
+        for trade_id, trade in self.trades.items():
+            if trade["state"] in (TradeState.CLOSED, TradeState.CANCELLED, TradeState.PENDING,
+                                  TradeState.ENTRY_PLACED):
+                continue
+
+            # Trade is filled — must have a stop or trailing stop active
+            stop_id = trade["order_ids"].get("trailing_stop") or trade["order_ids"].get("stop")
+            if not stop_id:
+                logger.error(f"verify_stops: Trade {trade_id} has no stop order ID — placing stop")
+                self._place_exit_orders(trade)
+                continue
+
+            if stop_id not in open_order_ids:
+                logger.error(f"verify_stops: Trade {trade_id} stop order {stop_id} not active — re-placing")
+                # Clear the old stop ID so _place_exit_orders guard doesn't block
+                trade["order_ids"].pop("stop", None)
+                trade["order_ids"].pop("trailing_stop", None)
+                # Also clear TP IDs if they're gone (will be re-placed)
+                if trade["order_ids"].get("tp1") and trade["order_ids"]["tp1"] not in open_order_ids:
+                    trade["order_ids"].pop("tp1", None)
+                if trade["order_ids"].get("tp2") and trade["order_ids"]["tp2"] not in open_order_ids:
+                    trade["order_ids"].pop("tp2", None)
+                self._place_exit_orders(trade)
 
     def _save_state(self):
         os.makedirs(os.path.dirname(self.persistence_file), exist_ok=True)

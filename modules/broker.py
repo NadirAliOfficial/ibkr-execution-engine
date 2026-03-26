@@ -48,11 +48,24 @@ class IBKRBroker:
             except queue.Empty:
                 break
 
+    def set_verify_callback(self, callback):
+        self._verify_callback = callback
+
     def run_loop(self):
         """Main IB event loop — runs in the main thread."""
         logger.info("IB event loop running")
+        self._loop_counter = 0
         while True:
             self.process_queue()
+            self._loop_counter += 1
+            # Run stop verification every ~30s (0.05s * 600 = 30s)
+            if self._loop_counter >= 600:
+                self._loop_counter = 0
+                if hasattr(self, '_verify_callback') and self._verify_callback:
+                    try:
+                        self._verify_callback()
+                    except Exception as e:
+                        logger.error(f"Stop verification failed: {e}")
             self.ib.sleep(0.05)
 
     def connect(self):
