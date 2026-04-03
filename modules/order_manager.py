@@ -274,14 +274,17 @@ class OrderManager:
 
             bid = ticker.bid
             ask = ticker.ask
+            last = ticker.last
+
+            def _valid(v):
+                return v is not None and v == v and v > 0  # v == v catches nan
 
             if trade["side"] == "BUY":
-                check_price = bid
+                check_price = bid if _valid(bid) else (last if _valid(last) else None)
             else:
-                check_price = ask
+                check_price = ask if _valid(ask) else (last if _valid(last) else None)
 
-            # Skip invalid/stale tick values
-            if check_price is None or check_price <= 0:
+            if check_price is None:
                 continue
 
             self._evaluate_1r(trade, check_price)
@@ -514,8 +517,10 @@ class OrderManager:
                         self._place_exit_orders(trade)
                         continue  # _place_exit_orders also starts 1R monitoring
 
-                # Re-subscribe 1R monitoring for filled trades that haven't hit +1R yet
-                if (trade["state"] not in (TradeState.CLOSED, TradeState.CANCELLED) and
+                # Re-subscribe 1R monitoring for active filled trades that haven't hit +1R yet
+                filled_states = {TradeState.ENTRY_FILLED, TradeState.TP1_FILLED,
+                                 TradeState.TP2_FILLED, TradeState.RUNNER_ACTIVE}
+                if (trade["state"] in filled_states and
                         not trade.get("protection_1r_triggered") and
                         trade_id not in self._monitored_tickers):
                     logger.info(f"  Recovery: re-subscribing 1R monitoring for {trade_id}")
