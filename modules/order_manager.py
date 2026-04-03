@@ -399,6 +399,9 @@ class OrderManager:
         if trade["runner_trailing_active"]:
             return
 
+        # Stop 1R monitoring — trailing stop replaces the regular stop
+        self._stop_1r_monitoring(trade["trade_id"])
+
         stop_order_id = trade["order_ids"].get("stop")
 
         # Direct IB calls — this runs inside an IB callback (main thread)
@@ -559,15 +562,38 @@ class OrderManager:
 
             if stop_id not in open_order_ids:
                 logger.error(f"verify_stops: Trade {trade_id} stop order {stop_id} not active — re-placing")
-                # Clear the old stop ID so _place_exit_orders guard doesn't block
-                trade["order_ids"].pop("stop", None)
-                trade["order_ids"].pop("trailing_stop", None)
-                # Also clear TP IDs if they're gone (will be re-placed)
-                if trade["order_ids"].get("tp1") and trade["order_ids"]["tp1"] not in open_order_ids:
-                    trade["order_ids"].pop("tp1", None)
-                if trade["order_ids"].get("tp2") and trade["order_ids"]["tp2"] not in open_order_ids:
-                    trade["order_ids"].pop("tp2", None)
-                self._place_exit_orders(trade)
+                # Determine correct qty/price based on how much has already been filled
+                state = trade["state"]
+                if state == TradeState.ENTRY_FILLED:
+                    stop_qty = trade["total_shares"]
+                elif state == TradeState.TP1_FILLED:
+                    stop_qty = trade["bracket_sizes"]["tp2"] + trade["bracket_sizes"]["runner"]
+                else:
+                    # TP2_FILLED / RUNNER_ACTIVE — runner only
+                    stop_qty = trade["bracket_sizes"]["runner"]
+                stop_price = trade.get("current_stop_price", trade["stop_price"])
+
+                contract = None
+                for t in self.broker.ib.trades():
+                    if t.order.orderId == trade["order_ids"].get("entry"):
+                        contract = t.contract
+                        break
+                if not contract:
+                    contract = Stock(trade["symbol"], "SMART", "USD")
+
+                try:
+                    stop_order = StopOrder(trade["exit_side"], stop_qty, stop_price,
+                                          tif="GTC", outsideRth=True)
+                    stop_trade = self.broker.ib.placeOrder(contract, stop_order)
+                    trade["order_ids"]["stop"] = stop_trade.order.orderId
+                    trade["order_ids"].pop("trailing_stop", None)
+                    trade["current_stop_price"] = stop_price
+                    trade["updated_at"] = datetime.now().isoformat()
+                    logger.info(f"verify_stops: Re-placed stop for {trade_id} "
+                                f"qty={stop_qty}@{stop_price} id={stop_trade.order.orderId}")
+                    self._save_state()
+                except Exception as e:
+                    logger.error(f"verify_stops: Failed to re-place stop for {trade_id}: {e}")
 
     def _save_state(self):
         os.makedirs(os.path.dirname(self.persistence_file), exist_ok=True)

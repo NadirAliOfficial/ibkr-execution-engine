@@ -354,7 +354,7 @@
         // Refresh trades
         async function refreshTrades() {
             try {
-                const res = await fetch('/api/trades');
+                const res = await fetch('/api/trades/active');
                 const trades = await res.json();
                 const container = document.getElementById('tradesContainer');
 
