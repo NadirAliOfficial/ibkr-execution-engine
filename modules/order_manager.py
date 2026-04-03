@@ -229,6 +229,9 @@ class OrderManager:
                 contract = Stock(trade["symbol"], "SMART", "USD")
 
         try:
+            # Use delayed data (type 3) so monitoring works without live subscription.
+            # Paper accounts and accounts without TOP data feeds still get 15-min delayed bid/ask.
+            self.broker.ib.reqMarketDataType(3)
             ticker = self.broker.ib.reqMktData(contract, "", False, False)
             self._monitored_tickers[trade_id] = ticker
             entry = trade["entry_price"]
