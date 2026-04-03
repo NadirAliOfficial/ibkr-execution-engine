@@ -16,7 +16,7 @@
     },
     "protection": {
         "one_r_trigger": 1.0,
-        "one_r_stop_offset_r": 0.0
+        "one_r_stop_offset_r": 0.10
     },
     "state": {
         "persistence_file": "state/trades.json"
