@@ -51,6 +51,9 @@ class IBKRBroker:
     def set_verify_callback(self, callback):
         self._verify_callback = callback
 
+    def set_price_monitor_callback(self, callback):
+        self._price_monitor_callback = callback
+
     def run_loop(self):
         """Main IB event loop — runs in the main thread."""
         logger.info("IB event loop running")
@@ -58,6 +61,13 @@ class IBKRBroker:
         while True:
             self.process_queue()
             self._loop_counter += 1
+            # Check 1R protection every ~0.5s (0.05s * 10 = 0.5s)
+            if self._loop_counter % 10 == 0:
+                if hasattr(self, '_price_monitor_callback') and self._price_monitor_callback:
+                    try:
+                        self._price_monitor_callback()
+                    except Exception as e:
+                        logger.error(f"1R price monitor failed: {e}")
             # Run stop verification every ~30s (0.05s * 600 = 30s)
             if self._loop_counter >= 600:
                 self._loop_counter = 0

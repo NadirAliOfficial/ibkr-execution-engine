@@ -26,6 +26,7 @@ class OrderManager:
         self.risk = risk_manager
         self.persistence_file = config["state"]["persistence_file"]
         self.trades = {}
+        self._monitored_tickers = {}  # trade_id -> Ticker (in-memory, reset on restart)
 
     def create_trade(self, symbol, side, entry_price, stop_price, risk_amount):
         total_shares = self.risk.calculate_position_size(entry_price, stop_price, risk_amount)
@@ -42,6 +43,7 @@ class OrderManager:
             "exit_side": exit_side,
             "entry_price": entry_price,
             "stop_price": stop_price,
+            "current_stop_price": stop_price,
             "risk_amount": risk_amount,
             "total_shares": total_shares,
             "bracket_sizes": bracket_sizes,
@@ -52,6 +54,7 @@ class OrderManager:
             "filled_qty": {"entry": 0, "tp1": 0, "tp2": 0, "runner": 0},
             "breakeven_moved": False,
             "runner_trailing_active": False,
+            "protection_1r_triggered": False,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
         }
@@ -121,12 +124,10 @@ class OrderManager:
                 logger.info(f"Trade {trade_id}: TP2 partial fill {filled_qty}/{trade['bracket_sizes']['tp2']}")
 
         elif order_type == "stop" or order_type == "trailing_stop":
-            runner_qty = trade["bracket_sizes"]["runner"]
-            remaining_tp2 = trade["bracket_sizes"]["tp2"] - trade["filled_qty"]["tp2"]
-            expected_stop_fill = runner_qty + remaining_tp2
             trade["filled_qty"]["runner"] = filled_qty
             trade["state"] = TradeState.CLOSED
             logger.info(f"Trade {trade_id}: Stop/trailing filled, trade closed")
+            self._stop_1r_monitoring(trade_id)
             self._cancel_remaining_orders(trade)
 
         trade["updated_at"] = datetime.now().isoformat()
@@ -143,6 +144,7 @@ class OrderManager:
         if status == "Cancelled" and order_type == "entry":
             trade["state"] = TradeState.CANCELLED
             trade["updated_at"] = datetime.now().isoformat()
+            self._stop_1r_monitoring(trade["trade_id"])
             self._cancel_remaining_orders(trade)
             self._save_state()
 
@@ -174,6 +176,7 @@ class OrderManager:
                                    trade["stop_price"], tif="GTC", outsideRth=True)
             stop_trade = self.broker.ib.placeOrder(contract, stop_order)
             trade["order_ids"]["stop"] = stop_trade.order.orderId
+            trade["current_stop_price"] = trade["stop_price"]
             logger.info(f"Trade {trade['trade_id']}: Stop placed id={stop_trade.order.orderId} "
                          f"{trade['total_shares']}@{trade['stop_price']}")
             self._save_state()
@@ -206,6 +209,146 @@ class OrderManager:
 
         self._save_state()
 
+        # Start 1R monitoring after exit orders are live
+        self._start_1r_monitoring(trade, contract)
+
+    def _start_1r_monitoring(self, trade, contract=None):
+        """Subscribe to market data for 1R protection monitoring. Direct IB call (main thread)."""
+        if trade.get("protection_1r_triggered"):
+            return
+        trade_id = trade["trade_id"]
+        if trade_id in self._monitored_tickers:
+            return  # already subscribed
+
+        if contract is None:
+            for t in self.broker.ib.trades():
+                if t.order.orderId == trade["order_ids"].get("entry"):
+                    contract = t.contract
+                    break
+            if not contract:
+                contract = Stock(trade["symbol"], "SMART", "USD")
+
+        try:
+            ticker = self.broker.ib.reqMktData(contract, "", False, False)
+            self._monitored_tickers[trade_id] = ticker
+            entry = trade["entry_price"]
+            stop = trade["stop_price"]
+            r = abs(entry - stop)
+            cfg = self.config.get("protection", {})
+            trigger_multiple = cfg.get("one_r_trigger", 1.0)
+            trigger_level = (entry + r * trigger_multiple if trade["side"] == "BUY"
+                             else entry - r * trigger_multiple)
+            logger.info(f"Trade {trade_id}: 1R monitoring started — "
+                         f"trigger={'bid' if trade['side'] == 'BUY' else 'ask'}>={trigger_level:.2f}")
+        except Exception as e:
+            logger.error(f"Trade {trade_id}: Failed to start 1R monitoring: {e}")
+
+    def _stop_1r_monitoring(self, trade_id):
+        """Cancel market data subscription for this trade."""
+        ticker = self._monitored_tickers.pop(trade_id, None)
+        if ticker is not None:
+            try:
+                self.broker.ib.cancelMktData(ticker.contract)
+                logger.info(f"Trade {trade_id}: 1R monitoring stopped")
+            except Exception as e:
+                logger.warning(f"Trade {trade_id}: Could not cancel market data: {e}")
+
+    def check_1r_protections(self):
+        """Evaluate 1R protection for all monitored trades. Called from IB event loop (main thread)."""
+        for trade_id, ticker in list(self._monitored_tickers.items()):
+            trade = self.trades.get(trade_id)
+            if not trade:
+                self._stop_1r_monitoring(trade_id)
+                continue
+
+            if trade["state"] in (TradeState.CLOSED, TradeState.CANCELLED):
+                self._stop_1r_monitoring(trade_id)
+                continue
+
+            if trade.get("protection_1r_triggered"):
+                self._stop_1r_monitoring(trade_id)
+                continue
+
+            bid = ticker.bid
+            ask = ticker.ask
+
+            if trade["side"] == "BUY":
+                check_price = bid
+            else:
+                check_price = ask
+
+            # Skip invalid/stale tick values
+            if check_price is None or check_price <= 0:
+                continue
+
+            self._evaluate_1r(trade, check_price)
+
+    def _evaluate_1r(self, trade, check_price):
+        """Check if +1R threshold crossed; move stop if so."""
+        entry = trade["entry_price"]
+        stop = trade["stop_price"]
+        r = abs(entry - stop)
+        cfg = self.config.get("protection", {})
+        trigger_multiple = cfg.get("one_r_trigger", 1.0)
+        offset_r = cfg.get("one_r_stop_offset_r", 0.0)
+
+        if trade["side"] == "BUY":
+            trigger_level = entry + r * trigger_multiple
+            new_stop = round(entry + r * offset_r, 2)
+            triggered = check_price >= trigger_level
+            is_protective = new_stop > trade.get("current_stop_price", trade["stop_price"])
+        else:
+            trigger_level = entry - r * trigger_multiple
+            new_stop = round(entry - r * offset_r, 2)
+            triggered = check_price <= trigger_level
+            is_protective = new_stop < trade.get("current_stop_price", trade["stop_price"])
+
+        if not triggered:
+            return
+
+        logger.info(f"Trade {trade['trade_id']}: +1R triggered — "
+                     f"{'bid' if trade['side'] == 'BUY' else 'ask'}={check_price:.2f} "
+                     f"trigger={trigger_level:.2f}, moving stop to {new_stop:.2f}")
+
+        if not is_protective:
+            logger.info(f"Trade {trade['trade_id']}: Stop already at {trade.get('current_stop_price'):.2f} "
+                         f">= {new_stop:.2f}, marking triggered without move")
+            trade["protection_1r_triggered"] = True
+            trade["updated_at"] = datetime.now().isoformat()
+            self._save_state()
+            self._stop_1r_monitoring(trade["trade_id"])
+            return
+
+        self._apply_1r_stop(trade, new_stop)
+
+    def _apply_1r_stop(self, trade, new_stop_price):
+        """Modify the active stop order to the 1R protection price. Direct IB call (main thread)."""
+        stop_id = trade["order_ids"].get("stop")
+        if not stop_id:
+            logger.error(f"Trade {trade['trade_id']}: No stop order to move for 1R protection")
+            return
+
+        for t in self.broker.ib.openTrades():
+            if t.order.orderId == stop_id:
+                t.order.auxPrice = new_stop_price
+                t.order.outsideRth = True
+                self.broker.ib.placeOrder(t.contract, t.order)
+                trade["protection_1r_triggered"] = True
+                trade["current_stop_price"] = new_stop_price
+                trade["updated_at"] = datetime.now().isoformat()
+                logger.info(f"Trade {trade['trade_id']}: Stop moved to {new_stop_price:.2f} "
+                             f"(1R protection locked)")
+                self._save_state()
+                self._stop_1r_monitoring(trade["trade_id"])
+                return
+
+        logger.warning(f"Trade {trade['trade_id']}: Stop order {stop_id} not found in open trades "
+                        f"for 1R protection — marking triggered anyway")
+        trade["protection_1r_triggered"] = True
+        trade["updated_at"] = datetime.now().isoformat()
+        self._save_state()
+        self._stop_1r_monitoring(trade["trade_id"])
+
     def _move_stop_to_breakeven(self, trade):
         if trade["breakeven_moved"]:
             return
@@ -214,17 +357,33 @@ class OrderManager:
         if not stop_order_id:
             return
 
+        entry = trade["entry_price"]
+        current = trade.get("current_stop_price", trade["stop_price"])
+
+        # Ratchet: only move price if entry is more protective than current stop
+        if trade["side"] == "BUY":
+            price_move_needed = entry > current
+        else:
+            price_move_needed = entry < current
+
         # Direct IB calls — this runs inside an IB callback (main thread)
         for t in self.broker.ib.openTrades():
             if t.order.orderId == stop_order_id:
                 new_qty = trade["bracket_sizes"]["tp2"] + trade["bracket_sizes"]["runner"]
-                t.order.auxPrice = trade["entry_price"]
+                if price_move_needed:
+                    t.order.auxPrice = entry
+                    new_price = entry
+                else:
+                    new_price = current
                 t.order.totalQuantity = new_qty
                 t.order.outsideRth = True
                 self.broker.ib.placeOrder(t.contract, t.order)
                 trade["breakeven_moved"] = True
+                if price_move_needed:
+                    trade["current_stop_price"] = entry
                 trade["updated_at"] = datetime.now().isoformat()
-                logger.info(f"Trade {trade['trade_id']}: Stop moved to breakeven @{trade['entry_price']} qty={new_qty}")
+                logger.info(f"Trade {trade['trade_id']}: Stop updated after TP1 — "
+                             f"price={new_price} qty={new_qty}")
                 self._save_state()
                 return
 
@@ -316,6 +475,12 @@ class OrderManager:
             if trade["state"] in (TradeState.CLOSED, TradeState.CANCELLED):
                 continue
 
+            # Backfill current_stop_price for trades persisted before this field existed
+            if "current_stop_price" not in trade:
+                trade["current_stop_price"] = trade["stop_price"]
+            if "protection_1r_triggered" not in trade:
+                trade["protection_1r_triggered"] = False
+
             symbol = trade["symbol"]
             logger.info(f"Recovering trade {trade_id} (state={trade['state']})")
 
@@ -344,6 +509,14 @@ class OrderManager:
                     if "tp1" not in trade["order_ids"]:
                         logger.info(f"  Recovery: placing exit orders for {trade_id}")
                         self._place_exit_orders(trade)
+                        continue  # _place_exit_orders also starts 1R monitoring
+
+                # Re-subscribe 1R monitoring for filled trades that haven't hit +1R yet
+                if (trade["state"] not in (TradeState.CLOSED, TradeState.CANCELLED) and
+                        not trade.get("protection_1r_triggered") and
+                        trade_id not in self._monitored_tickers):
+                    logger.info(f"  Recovery: re-subscribing 1R monitoring for {trade_id}")
+                    self._start_1r_monitoring(trade)
             else:
                 if trade["state"] not in (TradeState.PENDING, TradeState.ENTRY_PLACED):
                     logger.warning(f"  No position found but trade state is {trade['state']}")
@@ -411,11 +584,13 @@ class OrderManager:
             "side": trade["side"],
             "entry_price": trade["entry_price"],
             "stop_price": trade["stop_price"],
+            "current_stop_price": trade.get("current_stop_price", trade["stop_price"]),
             "total_shares": trade["total_shares"],
             "state": trade["state"],
             "filled": trade["filled_qty"],
             "breakeven_moved": trade["breakeven_moved"],
             "runner_trailing_active": trade["runner_trailing_active"],
+            "protection_1r_triggered": trade.get("protection_1r_triggered", False),
             "tp_prices": trade["tp_prices"],
             "bracket_sizes": trade["bracket_sizes"],
             "updated_at": trade["updated_at"],

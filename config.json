@@ -14,6 +14,10 @@
         "runner_pct": 0.10,
         "trailing_stop_pct": 0.02
     },
+    "protection": {
+        "one_r_trigger": 1.0,
+        "one_r_stop_offset_r": 0.0
+    },
     "state": {
         "persistence_file": "state/trades.json"
     },
