@@ -286,6 +286,13 @@ class OrderManager:
                 check_price = ask if _valid(ask) else (last if _valid(last) else None)
 
             if check_price is None:
+                # Fallback: portfolio market price (covers 10089 no-subscription tickers)
+                for item in self.broker.ib.portfolio():
+                    if item.contract.symbol == trade["symbol"] and _valid(item.marketPrice):
+                        check_price = item.marketPrice
+                        break
+
+            if check_price is None:
                 continue
 
             self._evaluate_1r(trade, check_price)
