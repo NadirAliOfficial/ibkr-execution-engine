@@ -241,8 +241,9 @@ class OrderManager:
             trigger_multiple = cfg.get("one_r_trigger", 1.0)
             trigger_level = (entry + r * trigger_multiple if trade["side"] == "BUY"
                              else entry - r * trigger_multiple)
+            direction = ">=" if trade["side"] == "BUY" else "<="
             logger.info(f"Trade {trade_id}: 1R monitoring started — "
-                         f"trigger={'bid' if trade['side'] == 'BUY' else 'ask'}>={trigger_level:.2f}")
+                         f"trigger={'bid' if trade['side'] == 'BUY' else 'ask'}{direction}{trigger_level:.2f}")
         except Exception as e:
             logger.error(f"Trade {trade_id}: Failed to start 1R monitoring: {e}")
 
