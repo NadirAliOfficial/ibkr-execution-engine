@@ -27,6 +27,15 @@
         }
         .status-dot.connected { background: #3fb950; }
         .status-dot.disconnected { background: #f85149; }
+        .session-badge {
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-left: 12px;
+        }
+        .session-rth { background: #1a4b2e; color: #3fb950; }
+        .session-eth { background: #1f3a5f; color: #58a6ff; }
         .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
         .grid { display: grid; grid-template-columns: 380px 1fr; gap: 24px; }
 
@@ -174,9 +183,17 @@
 <body>
     <div class="header">
         <h1>IBKR Execution Engine</h1>
-        <div id="connectionStatus">
+        <div id="connectionStatus" style="display:flex;align-items:center;gap:8px;">
             <span class="status-dot disconnected" id="statusDot"></span>
             <span id="statusText">Checking...</span>
+            <span class="session-badge session-eth" id="sessionBadge">ETH</span>
+            <select id="sessionModeSelect" onchange="setSessionMode(this.value)"
+                style="background:#0d1117;border:1px solid #30363d;color:#c9d1d9;
+                       border-radius:4px;font-size:11px;padding:2px 6px;">
+                <option value="auto">Auto</option>
+                <option value="rth_only">RTH Only</option>
+                <option value="eth_allowed">ETH Allowed</option>
+            </select>
         </div>
     </div>
 
@@ -211,6 +228,21 @@
                         <label>Risk Per Trade ($)</label>
                         <input type="number" id="riskAmount" step="1" value="{{ defaults.risk_per_trade }}">
                     </div>
+                    <div class="form-group">
+                        <label>Execution Mode</label>
+                        <select id="modeSelect" onchange="updatePreview()">
+                            {% for name, cfg in modes.items() %}
+                            <option value="{{ name }}"
+                                data-tp1="{{ cfg.tp1_pct }}"
+                                data-tp2="{{ cfg.tp2_pct }}"
+                                data-runner="{{ cfg.runner_pct }}"
+                                {% if name == default_mode %}selected{% endif %}>
+                                {{ name | capitalize }}
+                                ({{ (cfg.tp1_pct * 100) | int }}/{{ (cfg.tp2_pct * 100) | int }}/{{ (cfg.runner_pct * 100) | int }})
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
 
                     <!-- Order Preview -->
                     <div class="preview" id="preview" style="display:none;">
@@ -223,15 +255,15 @@
                             <span class="preview-value" id="prevRiskPerShare">-</span>
                         </div>
                         <div class="preview-row">
-                            <span class="preview-label">TP1 (50%)</span>
+                            <span class="preview-label" id="prevTP1Label">TP1</span>
                             <span class="preview-value" id="prevTP1">-</span>
                         </div>
                         <div class="preview-row">
-                            <span class="preview-label">TP2 (40%)</span>
+                            <span class="preview-label" id="prevTP2Label">TP2</span>
                             <span class="preview-value" id="prevTP2">-</span>
                         </div>
                         <div class="preview-row">
-                            <span class="preview-label">Runner (10%)</span>
+                            <span class="preview-label" id="prevRunnerLabel">Runner</span>
                             <span class="preview-value" id="prevRunner">-</span>
                         </div>
                     </div>
@@ -257,11 +289,25 @@
 
     <script>
         // Live preview
-        const fields = ['entryPrice', 'stopPrice', 'riskAmount', 'side'];
+        const fields = ['entryPrice', 'stopPrice', 'riskAmount', 'side', 'modeSelect'];
         fields.forEach(id => {
-            document.getElementById(id).addEventListener('input', updatePreview);
-            document.getElementById(id).addEventListener('change', updatePreview);
+            const el = document.getElementById(id);
+            if (el) {
+                el.addEventListener('input', updatePreview);
+                el.addEventListener('change', updatePreview);
+            }
         });
+
+        function getModeConfig() {
+            const sel = document.getElementById('modeSelect');
+            if (!sel) return { tp1: 0.50, tp2: 0.40, runner: 0.10 };
+            const opt = sel.options[sel.selectedIndex];
+            return {
+                tp1: parseFloat(opt.dataset.tp1 || 0.50),
+                tp2: parseFloat(opt.dataset.tp2 || 0.40),
+                runner: parseFloat(opt.dataset.runner || 0.10),
+            };
+        }
 
         function updatePreview() {
             const entry = parseFloat(document.getElementById('entryPrice').value);
@@ -279,8 +325,9 @@
             const totalShares = Math.floor(risk / riskPerShare);
             if (totalShares <= 0) { preview.style.display = 'none'; return; }
 
-            const tp1Qty = Math.floor(totalShares * 0.50);
-            const tp2Qty = Math.floor(totalShares * 0.40);
+            const mode = getModeConfig();
+            const tp1Qty = Math.floor(totalShares * mode.tp1);
+            const tp2Qty = Math.floor(totalShares * mode.tp2);
             const runnerQty = totalShares - tp1Qty - tp2Qty;
 
             const riskAmt = Math.abs(entry - stop);
@@ -293,12 +340,32 @@
                 tp2Price = (entry - riskAmt * 2.5).toFixed(2);
             }
 
+            const tp1Pct = Math.round(mode.tp1 * 100);
+            const tp2Pct = Math.round(mode.tp2 * 100);
+            const runnerPct = Math.round(mode.runner * 100);
+
             document.getElementById('prevShares').textContent = totalShares + ' shares';
             document.getElementById('prevRiskPerShare').textContent = '$' + riskPerShare.toFixed(2);
+            document.getElementById('prevTP1Label').textContent = `TP1 (${tp1Pct}%)`;
             document.getElementById('prevTP1').textContent = tp1Qty + ' @ $' + tp1Price;
+            document.getElementById('prevTP2Label').textContent = `TP2 (${tp2Pct}%)`;
             document.getElementById('prevTP2').textContent = tp2Qty + ' @ $' + tp2Price;
-            document.getElementById('prevRunner').textContent = runnerQty + ' (trailing)';
+            document.getElementById('prevRunnerLabel').textContent = `Runner (${runnerPct}%)`;
+            document.getElementById('prevRunner').textContent = runnerQty > 0 ? runnerQty + ' (trailing)' : '0 (disabled)';
             preview.style.display = 'block';
+        }
+
+        // Session mode
+        async function setSessionMode(mode) {
+            try {
+                await fetch('/api/session', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode }),
+                });
+            } catch (e) {
+                console.error('Failed to set session mode:', e);
+            }
         }
 
         // Execute trade
@@ -309,12 +376,17 @@
             errorMsg.style.display = 'none';
             successMsg.style.display = 'none';
 
+            const modeEl = document.getElementById('modeSelect');
+            const sessionEl = document.getElementById('sessionModeSelect');
+
             const data = {
                 symbol: document.getElementById('symbol').value,
                 side: document.getElementById('side').value,
                 entry_price: document.getElementById('entryPrice').value,
                 stop_price: document.getElementById('stopPrice').value,
                 risk_amount: document.getElementById('riskAmount').value,
+                mode: modeEl ? modeEl.value : null,
+                session_mode: sessionEl ? sessionEl.value : null,
             };
 
             if (!data.symbol || !data.entry_price || !data.stop_price || !data.risk_amount) {
@@ -370,7 +442,8 @@
                 let html = `<table>
                     <thead><tr>
                         <th>Symbol</th><th>Side</th><th>Entry</th><th>Shares</th>
-                        <th>State</th><th>TP1</th><th>TP2</th><th>BE</th><th></th>
+                        <th>Mode</th><th>Session</th><th>State</th>
+                        <th>TP1</th><th>TP2</th><th>BE</th><th>Runner</th><th></th>
                     </tr></thead><tbody>`;
 
                 for (const id of tradeIds) {
@@ -378,16 +451,21 @@
                     const stateClass = 'state-' + (t.state || 'pending');
                     const cancelBtn = ['closed', 'cancelled'].includes(t.state) ? '' :
                         `<button class="btn-cancel" onclick="cancelTrade('${id}')">Cancel</button>`;
+                    const runnerStatus = t.bracket_sizes?.runner === 0 ? 'N/A' :
+                        t.runner_activated ? 'Active' : (t.runner_trailing_active ? 'Waiting' : '-');
 
                     html += `<tr>
                         <td><strong>${t.symbol}</strong></td>
                         <td>${t.side}</td>
                         <td>$${t.entry_price}</td>
                         <td>${t.total_shares}</td>
+                        <td>${t.mode || '-'}</td>
+                        <td>${t.session_mode || '-'}</td>
                         <td><span class="state-badge ${stateClass}">${t.state}</span></td>
                         <td>${t.filled?.tp1 || 0}/${t.bracket_sizes?.tp1 || '-'}</td>
                         <td>${t.filled?.tp2 || 0}/${t.bracket_sizes?.tp2 || '-'}</td>
                         <td>${t.breakeven_moved ? 'Yes' : '-'}</td>
+                        <td>${runnerStatus}</td>
                         <td>${cancelBtn}</td>
                     </tr>`;
                 }
@@ -417,12 +495,22 @@
                 const data = await res.json();
                 const dot = document.getElementById('statusDot');
                 const text = document.getElementById('statusText');
+                const badge = document.getElementById('sessionBadge');
+                const sessionSel = document.getElementById('sessionModeSelect');
                 if (data.connected) {
                     dot.className = 'status-dot connected';
                     text.textContent = 'Connected';
                 } else {
                     dot.className = 'status-dot disconnected';
                     text.textContent = 'Disconnected';
+                }
+                if (badge && data.session_state) {
+                    badge.textContent = data.session_state;
+                    badge.className = 'session-badge ' +
+                        (data.session_state === 'RTH' ? 'session-rth' : 'session-eth');
+                }
+                if (sessionSel && data.session_mode) {
+                    sessionSel.value = data.session_mode;
                 }
             } catch (e) {
                 document.getElementById('statusDot').className = 'status-dot disconnected';

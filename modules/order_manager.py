@@ -1,10 +1,13 @@
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 from ib_insync import Stock, Order, LimitOrder, StopOrder
 
 logger = logging.getLogger(__name__)
+
+_ET = ZoneInfo("America/New_York")
 
 
 class TradeState:
@@ -26,11 +29,64 @@ class OrderManager:
         self.risk = risk_manager
         self.persistence_file = config["state"]["persistence_file"]
         self.trades = {}
-        self._monitored_tickers = {}  # trade_id -> Ticker (in-memory, reset on restart)
+        self._monitored_tickers = {}   # trade_id -> Ticker (1R monitoring)
+        self._runner_tickers = {}      # trade_id -> Ticker (runner trailing monitoring)
+        self._session_mode = config.get("session", {}).get("mode", "auto")
 
-    def create_trade(self, symbol, side, entry_price, stop_price, risk_amount):
+    # ------------------------------------------------------------------
+    # Session helpers
+    # ------------------------------------------------------------------
+
+    def _is_rth(self):
+        now = datetime.now(_ET)
+        if now.weekday() >= 5:
+            return False
+        t = now.time()
+        return dtime(9, 30) <= t < dtime(16, 0)
+
+    def get_session_state(self):
+        return "RTH" if self._is_rth() else "ETH"
+
+    def get_session_mode(self):
+        return self._session_mode
+
+    def set_session_mode(self, mode):
+        valid = ("auto", "rth_only", "eth_allowed")
+        if mode not in valid:
+            raise ValueError(f"Invalid session mode: {mode}. Must be one of {valid}")
+        self._session_mode = mode
+        logger.info(f"Session mode set to: {mode}")
+
+    def _check_session_allowed(self, session_mode):
+        if session_mode == "rth_only" and not self._is_rth():
+            raise ValueError("RTH-only mode: entries are blocked outside regular trading hours (9:30–16:00 ET)")
+
+    def _entry_outside_rth(self, session_mode):
+        """Returns True if entry order should have outsideRth=True."""
+        if session_mode == "eth_allowed":
+            return True
+        if session_mode == "auto" and not self._is_rth():
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Trade creation and execution
+    # ------------------------------------------------------------------
+
+    def create_trade(self, symbol, side, entry_price, stop_price, risk_amount,
+                     mode=None, session_mode=None):
+        mode = (mode or self.config.get("default_mode", "conservative")).lower()
+        session_mode = session_mode or self._session_mode
+
+        modes = self.config.get("modes", {})
+        mode_cfg = modes.get(mode)
+        if mode_cfg is None:
+            raise ValueError(f"Unknown mode '{mode}'. Available: {list(modes.keys())}")
+
+        self._check_session_allowed(session_mode)
+
         total_shares = self.risk.calculate_position_size(entry_price, stop_price, risk_amount)
-        bracket_sizes = self.risk.calculate_bracket_sizes(total_shares)
+        bracket_sizes = self.risk.calculate_bracket_sizes(total_shares, mode_cfg)
         tp_prices = self.risk.calculate_tp_prices(entry_price, stop_price, side)
         exit_side = "SELL" if side == "BUY" else "BUY"
 
@@ -49,11 +105,16 @@ class OrderManager:
             "bracket_sizes": bracket_sizes,
             "tp_prices": tp_prices,
             "trailing_stop_pct": self.risk.get_trailing_stop_pct(),
+            "mode": mode,
+            "session_mode": session_mode,
             "state": TradeState.PENDING,
             "order_ids": {},
             "filled_qty": {"entry": 0, "tp1": 0, "tp2": 0, "runner": 0},
             "breakeven_moved": False,
             "runner_trailing_active": False,
+            "runner_activated": False,
+            "runner_peak_price": None,
+            "runner_tp2_fill_time": None,
             "protection_1r_triggered": False,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
@@ -63,7 +124,7 @@ class OrderManager:
         self._save_state()
 
         logger.info(f"Trade created: {trade_id} | {side} {total_shares} {symbol}@{entry_price} "
-                     f"stop={stop_price} risk=${risk_amount}")
+                     f"stop={stop_price} risk=${risk_amount} mode={mode} session={session_mode}")
         logger.info(f"  Brackets: TP1={bracket_sizes['tp1']}@{tp_prices['tp1']} "
                      f"TP2={bracket_sizes['tp2']}@{tp_prices['tp2']} "
                      f"Runner={bracket_sizes['runner']}")
@@ -73,10 +134,11 @@ class OrderManager:
     def execute_trade(self, trade_id):
         trade = self.trades[trade_id]
         contract = self.broker.create_contract(trade["symbol"])
+        outside_rth = self._entry_outside_rth(trade.get("session_mode", "auto"))
 
-        # Place entry order only — child orders placed after entry fills
         entry_trade = self.broker.place_limit_order(
-            contract, trade["side"], trade["total_shares"], trade["entry_price"]
+            contract, trade["side"], trade["total_shares"], trade["entry_price"],
+            outside_rth=outside_rth
         )
         trade["order_ids"]["entry"] = entry_trade.order.orderId
 
@@ -84,9 +146,14 @@ class OrderManager:
         trade["updated_at"] = datetime.now().isoformat()
         self._save_state()
 
-        logger.info(f"Trade {trade_id} entry placed: id={trade['order_ids']['entry']}")
+        logger.info(f"Trade {trade_id} entry placed: id={trade['order_ids']['entry']} "
+                     f"outsideRth={outside_rth}")
 
         return trade
+
+    # ------------------------------------------------------------------
+    # Fill and status handling
+    # ------------------------------------------------------------------
 
     def handle_fill(self, order_id, filled_qty, avg_price):
         trade = self._find_trade_by_order(order_id)
@@ -128,6 +195,7 @@ class OrderManager:
             trade["state"] = TradeState.CLOSED
             logger.info(f"Trade {trade_id}: Stop/trailing filled, trade closed")
             self._stop_1r_monitoring(trade_id)
+            self._stop_runner_monitoring(trade_id)
             self._cancel_remaining_orders(trade)
 
         trade["updated_at"] = datetime.now().isoformat()
@@ -145,17 +213,19 @@ class OrderManager:
             trade["state"] = TradeState.CANCELLED
             trade["updated_at"] = datetime.now().isoformat()
             self._stop_1r_monitoring(trade["trade_id"])
+            self._stop_runner_monitoring(trade["trade_id"])
             self._cancel_remaining_orders(trade)
             self._save_state()
 
+    # ------------------------------------------------------------------
+    # Exit order placement
+    # ------------------------------------------------------------------
+
     def _place_exit_orders(self, trade):
-        """Place TP1, TP2, and stop orders after entry fills. Direct IB calls (callback context)."""
-        # Guard: don't place exit orders twice
         if "stop" in trade["order_ids"]:
             logger.warning(f"Trade {trade['trade_id']}: Exit orders already placed, skipping")
             return
 
-        # Get qualified contract from the filled entry trade
         contract = None
         for t in self.broker.ib.trades():
             if t.order.orderId == trade["order_ids"]["entry"]:
@@ -170,7 +240,6 @@ class OrderManager:
                 logger.error(f"Trade {trade['trade_id']}: Failed to qualify fallback contract: {e}")
                 return
 
-        # Place STOP FIRST — position protection is the priority
         try:
             stop_order = StopOrder(trade["exit_side"], trade["total_shares"],
                                    trade["stop_price"], tif="GTC", outsideRth=True)
@@ -185,7 +254,6 @@ class OrderManager:
             self._save_state()
             return
 
-        # TP1
         try:
             tp1_order = LimitOrder(trade["exit_side"], trade["bracket_sizes"]["tp1"],
                                    trade["tp_prices"]["tp1"], tif="GTC", outsideRth=True)
@@ -196,7 +264,6 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Trade {trade['trade_id']}: TP1 placement failed: {e}")
 
-        # TP2
         try:
             tp2_order = LimitOrder(trade["exit_side"], trade["bracket_sizes"]["tp2"],
                                    trade["tp_prices"]["tp2"], tif="GTC", outsideRth=True)
@@ -208,17 +275,18 @@ class OrderManager:
             logger.error(f"Trade {trade['trade_id']}: TP2 placement failed: {e}")
 
         self._save_state()
-
-        # Start 1R monitoring after exit orders are live
         self._start_1r_monitoring(trade, contract)
 
+    # ------------------------------------------------------------------
+    # 1R protection monitoring
+    # ------------------------------------------------------------------
+
     def _start_1r_monitoring(self, trade, contract=None):
-        """Subscribe to market data for 1R protection monitoring. Direct IB call (main thread)."""
         if trade.get("protection_1r_triggered"):
             return
         trade_id = trade["trade_id"]
         if trade_id in self._monitored_tickers:
-            return  # already subscribed
+            return
 
         if contract is None:
             for t in self.broker.ib.trades():
@@ -229,8 +297,6 @@ class OrderManager:
                 contract = Stock(trade["symbol"], "SMART", "USD")
 
         try:
-            # Use delayed data (type 3) so monitoring works without live subscription.
-            # Paper accounts and accounts without TOP data feeds still get 15-min delayed bid/ask.
             self.broker.ib.reqMarketDataType(3)
             ticker = self.broker.ib.reqMktData(contract, "", False, False)
             self._monitored_tickers[trade_id] = ticker
@@ -248,17 +314,15 @@ class OrderManager:
             logger.error(f"Trade {trade_id}: Failed to start 1R monitoring: {e}")
 
     def _stop_1r_monitoring(self, trade_id):
-        """Cancel market data subscription for this trade."""
         ticker = self._monitored_tickers.pop(trade_id, None)
         if ticker is not None:
             try:
                 self.broker.ib.cancelMktData(ticker.contract)
                 logger.info(f"Trade {trade_id}: 1R monitoring stopped")
             except Exception as e:
-                logger.warning(f"Trade {trade_id}: Could not cancel market data: {e}")
+                logger.warning(f"Trade {trade_id}: Could not cancel 1R market data: {e}")
 
     def check_1r_protections(self):
-        """Evaluate 1R protection for all monitored trades. Called from IB event loop (main thread)."""
         for trade_id, ticker in list(self._monitored_tickers.items()):
             trade = self.trades.get(trade_id)
             if not trade:
@@ -273,32 +337,13 @@ class OrderManager:
                 self._stop_1r_monitoring(trade_id)
                 continue
 
-            bid = ticker.bid
-            ask = ticker.ask
-            last = ticker.last
-
-            def _valid(v):
-                return v is not None and v == v and v > 0  # v == v catches nan
-
-            if trade["side"] == "BUY":
-                check_price = bid if _valid(bid) else (last if _valid(last) else None)
-            else:
-                check_price = ask if _valid(ask) else (last if _valid(last) else None)
-
-            if check_price is None:
-                # Fallback: portfolio market price (covers 10089 no-subscription tickers)
-                for item in self.broker.ib.portfolio():
-                    if item.contract.symbol == trade["symbol"] and _valid(item.marketPrice):
-                        check_price = item.marketPrice
-                        break
-
+            check_price = self._get_check_price(trade, ticker)
             if check_price is None:
                 continue
 
             self._evaluate_1r(trade, check_price)
 
     def _evaluate_1r(self, trade, check_price):
-        """Check if +1R threshold crossed; move stop if so."""
         entry = trade["entry_price"]
         stop = trade["stop_price"]
         r = abs(entry - stop)
@@ -336,7 +381,6 @@ class OrderManager:
         self._apply_1r_stop(trade, new_stop)
 
     def _apply_1r_stop(self, trade, new_stop_price):
-        """Modify the active stop order to the 1R protection price. Direct IB call (main thread)."""
         stop_id = trade["order_ids"].get("stop")
         if not stop_id:
             logger.error(f"Trade {trade['trade_id']}: No stop order to move for 1R protection")
@@ -363,6 +407,188 @@ class OrderManager:
         self._save_state()
         self._stop_1r_monitoring(trade["trade_id"])
 
+    # ------------------------------------------------------------------
+    # Runner trailing monitoring
+    # ------------------------------------------------------------------
+
+    def _activate_runner_trailing(self, trade):
+        if trade["runner_trailing_active"]:
+            return
+
+        runner_qty = trade["bracket_sizes"]["runner"]
+
+        # Scalp / 0% runner: close out cleanly after TP2
+        if runner_qty == 0:
+            self._stop_1r_monitoring(trade["trade_id"])
+            stop_id = trade["order_ids"].get("stop")
+            if stop_id:
+                for t in self.broker.ib.openTrades():
+                    if t.order.orderId == stop_id:
+                        self.broker.ib.cancelOrder(t.order)
+                        break
+            trade["state"] = TradeState.CLOSED
+            trade["runner_trailing_active"] = True
+            trade["updated_at"] = datetime.now().isoformat()
+            logger.info(f"Trade {trade['trade_id']}: Runner allocation is 0% (Scalp) — "
+                         f"trade closed after TP2")
+            self._save_state()
+            return
+
+        # Update stop qty to runner only
+        stop_id = trade["order_ids"].get("stop")
+        if stop_id:
+            for t in self.broker.ib.openTrades():
+                if t.order.orderId == stop_id:
+                    t.order.totalQuantity = runner_qty
+                    t.order.outsideRth = True
+                    self.broker.ib.placeOrder(t.contract, t.order)
+                    logger.info(f"Trade {trade['trade_id']}: Stop qty updated to runner={runner_qty} "
+                                 f"after TP2 fill")
+                    break
+
+        trade["runner_tp2_fill_time"] = datetime.now().isoformat()
+        trade["runner_activated"] = False
+        trade["runner_peak_price"] = None
+        trade["runner_trailing_active"] = True
+        trade["updated_at"] = datetime.now().isoformat()
+        self._save_state()
+
+        self._start_runner_monitoring(trade)
+
+        runner_cfg = self.config.get("runner", {})
+        activation_type = runner_cfg.get("activation_type", "price")
+        logger.info(f"Trade {trade['trade_id']}: Runner monitoring started — "
+                     f"activation_type={activation_type} awaiting trigger")
+
+    def _start_runner_monitoring(self, trade, contract=None):
+        trade_id = trade["trade_id"]
+        if trade_id in self._runner_tickers:
+            return
+
+        if contract is None:
+            for t in self.broker.ib.trades():
+                if t.order.orderId == trade["order_ids"].get("entry"):
+                    contract = t.contract
+                    break
+            if not contract:
+                contract = Stock(trade["symbol"], "SMART", "USD")
+
+        try:
+            # Reuse existing 1R ticker if available to avoid duplicate subscriptions
+            existing = self._monitored_tickers.get(trade_id)
+            if existing is not None:
+                self._runner_tickers[trade_id] = existing
+            else:
+                self.broker.ib.reqMarketDataType(3)
+                ticker = self.broker.ib.reqMktData(contract, "", False, False)
+                self._runner_tickers[trade_id] = ticker
+        except Exception as e:
+            logger.error(f"Trade {trade_id}: Failed to start runner monitoring: {e}")
+
+    def _stop_runner_monitoring(self, trade_id):
+        ticker = self._runner_tickers.pop(trade_id, None)
+        if ticker is not None:
+            # Only cancel market data if not also used by 1R monitoring
+            if trade_id not in self._monitored_tickers:
+                try:
+                    self.broker.ib.cancelMktData(ticker.contract)
+                except Exception as e:
+                    logger.warning(f"Trade {trade_id}: Could not cancel runner market data: {e}")
+            logger.info(f"Trade {trade_id}: Runner monitoring stopped")
+
+    def check_runner_trailing(self):
+        for trade_id, ticker in list(self._runner_tickers.items()):
+            trade = self.trades.get(trade_id)
+            if not trade:
+                self._stop_runner_monitoring(trade_id)
+                continue
+
+            if trade["state"] in (TradeState.CLOSED, TradeState.CANCELLED):
+                self._stop_runner_monitoring(trade_id)
+                continue
+
+            check_price = self._get_check_price(trade, ticker)
+            if check_price is None:
+                continue
+
+            self._evaluate_runner(trade, check_price)
+
+    def _evaluate_runner(self, trade, check_price):
+        runner_cfg = self.config.get("runner", {})
+        activation_type = runner_cfg.get("activation_type", "price")
+        price_ext_r = runner_cfg.get("price_extension_r", 0.25)
+        time_delay = runner_cfg.get("time_delay_seconds", 20)
+        trailing_r = runner_cfg.get("trailing_distance_r", 0.25)
+
+        entry = trade["entry_price"]
+        stop = trade["stop_price"]
+        r = abs(entry - stop)
+        tp2_price = trade["tp_prices"]["tp2"]
+        is_long = trade["side"] == "BUY"
+
+        if not trade.get("runner_activated"):
+            activated = False
+            if activation_type == "price":
+                if is_long:
+                    activated = check_price >= tp2_price + r * price_ext_r
+                else:
+                    activated = check_price <= tp2_price - r * price_ext_r
+            else:
+                fill_time_str = trade.get("runner_tp2_fill_time")
+                if fill_time_str:
+                    elapsed = (datetime.now() - datetime.fromisoformat(fill_time_str)).total_seconds()
+                    activated = elapsed >= time_delay
+
+            if activated:
+                trade["runner_activated"] = True
+                trade["runner_peak_price"] = check_price
+                trade["state"] = TradeState.RUNNER_ACTIVE
+                trade["updated_at"] = datetime.now().isoformat()
+                logger.info(f"Trade {trade['trade_id']}: Runner activated — "
+                             f"{'bid' if is_long else 'ask'}={check_price:.2f} "
+                             f"activation_type={activation_type}")
+                self._save_state()
+            return
+
+        # Runner active — update peak and ratchet stop
+        peak = trade.get("runner_peak_price") or check_price
+
+        if is_long:
+            if check_price > peak:
+                trade["runner_peak_price"] = check_price
+                peak = check_price
+            new_stop = round(peak - r * trailing_r, 2)
+            is_protective = new_stop > trade.get("current_stop_price", trade["stop_price"])
+        else:
+            if check_price < peak:
+                trade["runner_peak_price"] = check_price
+                peak = check_price
+            new_stop = round(peak + r * trailing_r, 2)
+            is_protective = new_stop < trade.get("current_stop_price", trade["stop_price"])
+
+        if not is_protective:
+            return
+
+        stop_id = trade["order_ids"].get("stop")
+        if not stop_id:
+            return
+
+        for t in self.broker.ib.openTrades():
+            if t.order.orderId == stop_id:
+                t.order.auxPrice = new_stop
+                t.order.outsideRth = True
+                self.broker.ib.placeOrder(t.contract, t.order)
+                trade["current_stop_price"] = new_stop
+                trade["updated_at"] = datetime.now().isoformat()
+                logger.info(f"Trade {trade['trade_id']}: Runner trailing stop updated to {new_stop:.2f} "
+                             f"(peak={'bid' if is_long else 'ask'}={peak:.2f})")
+                self._save_state()
+                return
+
+    # ------------------------------------------------------------------
+    # Stop to breakeven
+    # ------------------------------------------------------------------
+
     def _move_stop_to_breakeven(self, trade):
         if trade["breakeven_moved"]:
             return
@@ -374,13 +600,11 @@ class OrderManager:
         entry = trade["entry_price"]
         current = trade.get("current_stop_price", trade["stop_price"])
 
-        # Ratchet: only move price if entry is more protective than current stop
         if trade["side"] == "BUY":
             price_move_needed = entry > current
         else:
             price_move_needed = entry < current
 
-        # Direct IB calls — this runs inside an IB callback (main thread)
         for t in self.broker.ib.openTrades():
             if t.order.orderId == stop_order_id:
                 new_qty = trade["bracket_sizes"]["tp2"] + trade["bracket_sizes"]["runner"]
@@ -403,51 +627,33 @@ class OrderManager:
 
         logger.warning(f"Trade {trade['trade_id']}: Could not find stop order to move to breakeven")
 
-    def _activate_runner_trailing(self, trade):
-        if trade["runner_trailing_active"]:
-            return
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-        # Stop 1R monitoring — trailing stop replaces the regular stop
-        self._stop_1r_monitoring(trade["trade_id"])
+    def _get_check_price(self, trade, ticker):
+        bid = ticker.bid
+        ask = ticker.ask
+        last = ticker.last
 
-        stop_order_id = trade["order_ids"].get("stop")
+        def _valid(v):
+            return v is not None and v == v and v > 0
 
-        # Direct IB calls — this runs inside an IB callback (main thread)
-        # Cancel existing stop
-        if stop_order_id:
-            for t in self.broker.ib.openTrades():
-                if t.order.orderId == stop_order_id:
-                    self.broker.ib.cancelOrder(t.order)
+        if trade["side"] == "BUY":
+            check_price = bid if _valid(bid) else (last if _valid(last) else None)
+        else:
+            check_price = ask if _valid(ask) else (last if _valid(last) else None)
+
+        if check_price is None:
+            for item in self.broker.ib.portfolio():
+                if item.contract.symbol == trade["symbol"] and _valid(item.marketPrice):
+                    check_price = item.marketPrice
                     break
 
-        # Place trailing stop for runner — get contract from existing trade
-        contract = None
-        for t in self.broker.ib.trades():
-            if t.order.orderId == trade["order_ids"]["entry"]:
-                contract = t.contract
-                break
-        if not contract:
-            contract = Stock(trade["symbol"], "SMART", "USD")
-        order = Order()
-        order.action = trade["exit_side"]
-        order.totalQuantity = trade["bracket_sizes"]["runner"]
-        order.orderType = "TRAIL"
-        order.trailingPercent = trade["trailing_stop_pct"] * 100
-        order.tif = "GTC"
-        order.outsideRth = True
-        trailing_trade = self.broker.ib.placeOrder(contract, order)
-        trade["order_ids"]["trailing_stop"] = trailing_trade.order.orderId
-        trade["runner_trailing_active"] = True
-        trade["state"] = TradeState.RUNNER_ACTIVE
-        trade["updated_at"] = datetime.now().isoformat()
-        logger.info(f"Trade {trade['trade_id']}: Runner trailing stop activated "
-                     f"qty={trade['bracket_sizes']['runner']} trail={trade['trailing_stop_pct']*100}%")
-        self._save_state()
+        return check_price
 
     def _cancel_remaining_orders(self, trade):
-        # Direct IB calls — this runs inside an IB callback (main thread)
         open_trades = self.broker.ib.openTrades()
-
         all_order_ids = set(trade["order_ids"].values())
         for t in open_trades:
             if t.order.orderId in all_order_ids:
@@ -457,7 +663,6 @@ class OrderManager:
                     logger.warning(f"Could not cancel order {t.order.orderId}: {e}")
 
     def _find_trade_by_order(self, order_id):
-        # Skip closed/cancelled trades — IB reuses order IDs across sessions
         for trade in self.trades.values():
             if trade["state"] in (TradeState.CLOSED, TradeState.CANCELLED):
                 continue
@@ -470,6 +675,10 @@ class OrderManager:
             if oid == order_id:
                 return key
         return "unknown"
+
+    # ------------------------------------------------------------------
+    # Recovery
+    # ------------------------------------------------------------------
 
     def recover_state(self):
         self._load_state()
@@ -492,50 +701,61 @@ class OrderManager:
             if trade["state"] in (TradeState.CLOSED, TradeState.CANCELLED):
                 continue
 
-            # Backfill current_stop_price for trades persisted before this field existed
+            # Backfill fields for trades persisted before 2A.2
             if "current_stop_price" not in trade:
                 trade["current_stop_price"] = trade["stop_price"]
             if "protection_1r_triggered" not in trade:
                 trade["protection_1r_triggered"] = False
+            if "mode" not in trade:
+                trade["mode"] = self.config.get("default_mode", "conservative")
+            if "session_mode" not in trade:
+                trade["session_mode"] = "auto"
+            if "runner_activated" not in trade:
+                trade["runner_activated"] = False
+            if "runner_peak_price" not in trade:
+                trade["runner_peak_price"] = None
+            if "runner_tp2_fill_time" not in trade:
+                trade["runner_tp2_fill_time"] = None
 
             symbol = trade["symbol"]
             logger.info(f"Recovering trade {trade_id} (state={trade['state']})")
 
-            # Verify orders still exist
-            active_orders = []
             for order_type, oid in trade["order_ids"].items():
                 if oid in open_trades:
-                    active_orders.append(order_type)
                     logger.info(f"  {order_type} order {oid} still active")
                 else:
                     logger.info(f"  {order_type} order {oid} no longer active")
 
-            # Check position
             if symbol in positions:
                 pos = positions[symbol]
                 logger.info(f"  Position: {pos.position} shares @ avg {pos.avgCost}")
 
-                # If entry order is no longer active but we have a position, entry was filled
                 entry_oid = trade["order_ids"].get("entry")
                 if trade["state"] == TradeState.ENTRY_PLACED and entry_oid not in open_trades:
                     trade["filled_qty"]["entry"] = trade["total_shares"]
                     trade["state"] = TradeState.ENTRY_FILLED
                     trade["updated_at"] = datetime.now().isoformat()
                     logger.info(f"  Recovery: entry filled, state -> entry_filled")
-                    # Place exit orders if they don't exist yet
                     if "tp1" not in trade["order_ids"]:
                         logger.info(f"  Recovery: placing exit orders for {trade_id}")
                         self._place_exit_orders(trade)
-                        continue  # _place_exit_orders also starts 1R monitoring
+                        continue
 
-                # Re-subscribe 1R monitoring for active filled trades that haven't hit +1R yet
-                filled_states = {TradeState.ENTRY_FILLED, TradeState.TP1_FILLED,
-                                 TradeState.TP2_FILLED, TradeState.RUNNER_ACTIVE}
+                filled_states = {TradeState.ENTRY_FILLED, TradeState.TP1_FILLED}
                 if (trade["state"] in filled_states and
                         not trade.get("protection_1r_triggered") and
                         trade_id not in self._monitored_tickers):
                     logger.info(f"  Recovery: re-subscribing 1R monitoring for {trade_id}")
                     self._start_1r_monitoring(trade)
+
+                # Re-subscribe runner monitoring for TP2_FILLED / RUNNER_ACTIVE trades
+                runner_states = {TradeState.TP2_FILLED, TradeState.RUNNER_ACTIVE}
+                if (trade["state"] in runner_states and
+                        trade.get("runner_trailing_active") and
+                        trade["bracket_sizes"].get("runner", 0) > 0 and
+                        trade_id not in self._runner_tickers):
+                    logger.info(f"  Recovery: re-subscribing runner monitoring for {trade_id}")
+                    self._start_runner_monitoring(trade)
             else:
                 if trade["state"] not in (TradeState.PENDING, TradeState.ENTRY_PLACED):
                     logger.warning(f"  No position found but trade state is {trade['state']}")
@@ -545,9 +765,11 @@ class OrderManager:
         self._save_state()
         logger.info("State recovery complete")
 
+    # ------------------------------------------------------------------
+    # Stop verification
+    # ------------------------------------------------------------------
+
     def verify_stops(self):
-        """Check all filled trades have active stop orders. Re-place if missing.
-        Called periodically from the IB event loop (main thread)."""
         open_order_ids = set()
         try:
             for t in self.broker.ib.openTrades():
@@ -561,7 +783,6 @@ class OrderManager:
                                   TradeState.ENTRY_PLACED):
                 continue
 
-            # Trade is filled — must have a stop or trailing stop active
             stop_id = trade["order_ids"].get("trailing_stop") or trade["order_ids"].get("stop")
             if not stop_id:
                 logger.error(f"verify_stops: Trade {trade_id} has no stop order ID — placing stop")
@@ -570,14 +791,12 @@ class OrderManager:
 
             if stop_id not in open_order_ids:
                 logger.error(f"verify_stops: Trade {trade_id} stop order {stop_id} not active — re-placing")
-                # Determine correct qty/price based on how much has already been filled
                 state = trade["state"]
                 if state == TradeState.ENTRY_FILLED:
                     stop_qty = trade["total_shares"]
                 elif state == TradeState.TP1_FILLED:
                     stop_qty = trade["bracket_sizes"]["tp2"] + trade["bracket_sizes"]["runner"]
                 else:
-                    # TP2_FILLED / RUNNER_ACTIVE — runner only
                     stop_qty = trade["bracket_sizes"]["runner"]
                 stop_price = trade.get("current_stop_price", trade["stop_price"])
 
@@ -603,6 +822,10 @@ class OrderManager:
                 except Exception as e:
                     logger.error(f"verify_stops: Failed to re-place stop for {trade_id}: {e}")
 
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
     def _save_state(self):
         os.makedirs(os.path.dirname(self.persistence_file), exist_ok=True)
         with open(self.persistence_file, "w") as f:
@@ -615,6 +838,10 @@ class OrderManager:
             logger.info(f"Loaded {len(self.trades)} trades from state file")
         else:
             self.trades = {}
+
+    # ------------------------------------------------------------------
+    # Status queries
+    # ------------------------------------------------------------------
 
     def get_trade_status(self, trade_id):
         trade = self.trades.get(trade_id)
@@ -632,9 +859,12 @@ class OrderManager:
             "filled": trade["filled_qty"],
             "breakeven_moved": trade["breakeven_moved"],
             "runner_trailing_active": trade["runner_trailing_active"],
+            "runner_activated": trade.get("runner_activated", False),
             "protection_1r_triggered": trade.get("protection_1r_triggered", False),
             "tp_prices": trade["tp_prices"],
             "bracket_sizes": trade["bracket_sizes"],
+            "mode": trade.get("mode", "conservative"),
+            "session_mode": trade.get("session_mode", "auto"),
             "updated_at": trade["updated_at"],
         }
 

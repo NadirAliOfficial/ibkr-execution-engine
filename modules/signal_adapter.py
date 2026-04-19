@@ -12,8 +12,10 @@ class SignalAdapter:
     def __init__(self, execution_engine):
         self.engine = execution_engine
 
-    def process_manual_signal(self, symbol, side, entry_price, stop_price, risk_amount):
-        return self.engine.execute(symbol, side, entry_price, stop_price, risk_amount)
+    def process_manual_signal(self, symbol, side, entry_price, stop_price, risk_amount,
+                               mode=None, session_mode=None):
+        return self.engine.execute(symbol, side, entry_price, stop_price, risk_amount,
+                                   mode=mode, session_mode=session_mode)
 
     def process_webhook_signal(self, payload):
         """Phase 2: Process incoming webhook signal.

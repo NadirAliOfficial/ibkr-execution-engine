@@ -14,7 +14,8 @@ class ExecutionEngine:
         self.broker.set_status_callback(self._on_status)
         self.broker.set_disconnect_callback(self._on_disconnect)
 
-    def execute(self, symbol, side, entry_price, stop_price, risk_amount):
+    def execute(self, symbol, side, entry_price, stop_price, risk_amount,
+                mode=None, session_mode=None):
         if not self.broker.is_connected:
             raise ConnectionError("Not connected to IBKR Gateway")
 
@@ -30,7 +31,8 @@ class ExecutionEngine:
         if risk_amount <= 0:
             raise ValueError("Risk amount must be positive")
 
-        trade = self.orders.create_trade(symbol, side, entry_price, stop_price, risk_amount)
+        trade = self.orders.create_trade(symbol, side, entry_price, stop_price, risk_amount,
+                                         mode=mode, session_mode=session_mode)
         trade = self.orders.execute_trade(trade["trade_id"])
 
         logger.info(f"Execution started: {trade['trade_id']}")

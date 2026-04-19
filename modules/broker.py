@@ -54,6 +54,9 @@ class IBKRBroker:
     def set_price_monitor_callback(self, callback):
         self._price_monitor_callback = callback
 
+    def set_runner_monitor_callback(self, callback):
+        self._runner_monitor_callback = callback
+
     def run_loop(self):
         """Main IB event loop — runs in the main thread."""
         logger.info("IB event loop running")
@@ -61,13 +64,18 @@ class IBKRBroker:
         while True:
             self.process_queue()
             self._loop_counter += 1
-            # Check 1R protection every ~0.5s (0.05s * 10 = 0.5s)
+            # Check 1R protection and runner trailing every ~0.5s (0.05s * 10 = 0.5s)
             if self._loop_counter % 10 == 0:
                 if hasattr(self, '_price_monitor_callback') and self._price_monitor_callback:
                     try:
                         self._price_monitor_callback()
                     except Exception as e:
                         logger.error(f"1R price monitor failed: {e}")
+                if hasattr(self, '_runner_monitor_callback') and self._runner_monitor_callback:
+                    try:
+                        self._runner_monitor_callback()
+                    except Exception as e:
+                        logger.error(f"Runner monitor failed: {e}")
             # Run stop verification every ~30s (0.05s * 600 = 30s)
             if self._loop_counter >= 600:
                 self._loop_counter = 0
@@ -156,11 +164,14 @@ class IBKRBroker:
             return contract
         return self._execute_in_ib(_do)
 
-    def place_limit_order(self, contract, action, quantity, price, parent_id=None, tif="GTC"):
+    def place_limit_order(self, contract, action, quantity, price, parent_id=None, tif="GTC",
+                          outside_rth=False):
         def _do():
             order = LimitOrder(action, quantity, price, tif=tif)
             if parent_id:
                 order.parentId = parent_id
+            if outside_rth:
+                order.outsideRth = True
             trade = self.ib.placeOrder(contract, order)
             self.ib.sleep(0.2)
             logger.info(f"Placed limit {action} {quantity} {contract.symbol}@{price} id={trade.order.orderId}")

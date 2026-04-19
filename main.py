@@ -46,6 +46,7 @@ def main():
         order_manager.recover_state()
         broker.set_verify_callback(order_manager.verify_stops)
         broker.set_price_monitor_callback(order_manager.check_1r_protections)
+        broker.set_runner_monitor_callback(order_manager.check_runner_trailing)
 
     # Start Flask UI in background thread
     app = create_app(execution_engine, signal_adapter, broker, config)
