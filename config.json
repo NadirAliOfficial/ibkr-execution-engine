@@ -9,10 +9,22 @@
     },
     "defaults": {
         "risk_per_trade": 100.0,
-        "tp1_pct": 0.50,
-        "tp2_pct": 0.40,
-        "runner_pct": 0.10,
         "trailing_stop_pct": 0.02
+    },
+    "modes": {
+        "conservative": { "tp1_pct": 0.50, "tp2_pct": 0.40, "runner_pct": 0.10 },
+        "gapper":       { "tp1_pct": 0.20, "tp2_pct": 0.25, "runner_pct": 0.55 },
+        "scalp":        { "tp1_pct": 0.75, "tp2_pct": 0.25, "runner_pct": 0.00 }
+    },
+    "default_mode": "conservative",
+    "runner": {
+        "activation_type": "price",
+        "price_extension_r": 0.25,
+        "time_delay_seconds": 20,
+        "trailing_distance_r": 0.25
+    },
+    "session": {
+        "mode": "auto"
     },
     "protection": {
         "one_r_trigger": 1.0,
