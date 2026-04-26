@@ -52,6 +52,19 @@ class TestBracketSizes:
         result = rm.calculate_bracket_sizes(10, CONFIG["modes"]["conservative"])
         assert result["tp1"] + result["tp2"] + result["runner"] == 10
 
+    def test_scalp_110sh_runner_stays_zero(self, rm):
+        # Jeremy's regression: 110sh scalp had rounding residual leaking into runner
+        result = rm.calculate_bracket_sizes(110, CONFIG["modes"]["scalp"])
+        assert result["runner"] == 0, f"runner must be 0 for scalp, got {result['runner']}"
+        assert result["tp1"] + result["tp2"] + result["runner"] == 110
+
+    def test_residual_goes_to_tp2_not_runner(self, rm):
+        # Any mode where floor() leaves a remainder — residual must go to tp2
+        for shares in [7, 11, 17, 23, 110]:
+            result = rm.calculate_bracket_sizes(shares, CONFIG["modes"]["scalp"])
+            assert result["runner"] == 0, f"scalp runner must be 0 for {shares}sh, got {result}"
+            assert result["tp1"] + result["tp2"] == shares
+
     def test_invalid_percentages_raises(self, rm):
         bad = {"tp1_pct": 0.50, "tp2_pct": 0.40, "runner_pct": 0.20}
         with pytest.raises(ValueError, match="sum to 100%"):

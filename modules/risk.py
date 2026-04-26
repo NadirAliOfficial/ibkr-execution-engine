@@ -37,7 +37,9 @@ class RiskManager:
 
         tp1_qty = math.floor(total_shares * tp1_pct)
         tp2_qty = math.floor(total_shares * tp2_pct)
-        runner_qty = total_shares - tp1_qty - tp2_qty
+        runner_qty = math.floor(total_shares * runner_pct)
+        # Assign rounding residual to tp2 — never to runner (keeps scalp runner=0)
+        tp2_qty += total_shares - tp1_qty - tp2_qty - runner_qty
 
         if tp1_qty <= 0 or tp2_qty <= 0:
             raise ValueError(f"Position size {total_shares} too small for this mode's percentages")
