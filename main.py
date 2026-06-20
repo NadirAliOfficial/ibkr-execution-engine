@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def load_config(path="config.json"):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
