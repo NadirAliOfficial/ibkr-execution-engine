@@ -27,7 +27,7 @@ def check(name, condition, detail=""):
 # ------------------------------------------------------------------
 # Load config (clientId 2 for test)
 # ------------------------------------------------------------------
-with open("config.json") as f:
+with open("config.json", encoding="utf-8") as f:
     config = json.load(f)
 config["ibkr"]["client_id"] = 2
 
