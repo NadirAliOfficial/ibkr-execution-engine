@@ -43,7 +43,7 @@ connected = broker.connect()
 check("TWS connection", connected)
 if not connected:
     print("Cannot continue — not connected.")
-    exit(1)
+    sys.exit(1)
 
 om = OrderManager(config, broker, rm)
 
